@@ -6,8 +6,8 @@
 use std::fmt;
 use std::time::Duration;
 
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::age;
@@ -123,7 +123,12 @@ pub struct IssueList {
 }
 
 /// One comment of an issue detail, in the order it was written.
-#[derive(Debug, Clone)]
+///
+/// Serializable because a fetched comment page is cached as JSON in one column,
+/// exactly as the schema asks (`issue_comments.nodes_json`) — this type is the
+/// viewer's own shape, not the wire's, so the cached page is the parsed comments
+/// rather than a copy of the GraphQL response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssueComment {
     pub author: Option<String>,
     /// When the comment was written, in unix seconds.
@@ -134,8 +139,7 @@ pub struct IssueComment {
 
 /// The issue detail: body plus the comments fetched so far.
 ///
-/// Cached separately from the list, and separately invalidated — but the cache
-/// itself is a later ticket, so for now this lives only as long as the view.
+/// Cached separately from the list, and separately invalidated.
 #[derive(Debug, Clone)]
 pub struct IssueDetail {
     pub number: u64,
@@ -151,6 +155,10 @@ pub struct IssueDetail {
     pub comments: Vec<IssueComment>,
     /// Whether comments remain beyond the ones fetched.
     pub has_more_comments: bool,
+    /// The cursor the next comment page would be asked for with. Cached with
+    /// the page it ends, which is what makes paging resumable; asking for that
+    /// page is a later ticket.
+    pub comments_end_cursor: Option<String>,
     /// When this detail was fetched, in unix seconds.
     pub fetched_at: i64,
 }
@@ -484,6 +492,7 @@ impl Envelope<RepositoryDetail> {
             comment_total_count: issue.comments.total_count,
             comments,
             has_more_comments: issue.comments.page_info.has_next_page,
+            comments_end_cursor: issue.comments.page_info.end_cursor,
             fetched_at: age::now(),
         })
     }
@@ -523,6 +532,9 @@ struct Comments {
 struct PageInfo {
     #[serde(default)]
     has_next_page: bool,
+    /// Cached with the page, so the page after it can be asked for later.
+    #[serde(default)]
+    end_cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
