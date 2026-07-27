@@ -11,4 +11,5 @@ pub mod app;
 pub mod environment;
 pub mod github;
 pub mod identity;
+pub mod signals;
 pub mod ui;
