@@ -5,4 +5,5 @@
 //! below that seam is real: a real HTTP client, a real `git`, a real repo root.
 //! Only the GitHub endpoint is substitutable.
 
+pub mod environment;
 pub mod identity;
