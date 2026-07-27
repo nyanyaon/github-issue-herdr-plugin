@@ -24,8 +24,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use herdr_issues::app::App;
+use herdr_issues::config::Config;
 use herdr_issues::environment::Environment;
-use herdr_issues::identity::SlugOverrides;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use serde_json::json;
@@ -33,9 +33,17 @@ use serde_json::json;
 /// A local stand-in for `api.github.com/graphql`.
 pub struct StubGithub {
     pub url: String,
-    /// Every request body it has been sent, in order — which is how a test
-    /// asserts both what was asked for and that nothing was asked at all.
-    requests: Arc<Mutex<Vec<String>>>,
+    /// Every request it has been sent, in order — body and `Authorization`
+    /// header — which is how a test asserts what was asked for, with which
+    /// token, and that nothing was asked at all.
+    requests: Arc<Mutex<Vec<Request>>>,
+}
+
+/// One request as it arrived on the wire.
+#[derive(Debug, Clone)]
+pub struct Request {
+    pub body: String,
+    pub authorization: String,
 }
 
 impl StubGithub {
@@ -120,7 +128,17 @@ impl StubGithub {
 
     /// The body of the request at `index`, as sent.
     pub fn request(&self, index: usize) -> String {
-        self.requests.lock().expect("stub request log")[index].clone()
+        self.requests.lock().expect("stub request log")[index]
+            .body
+            .clone()
+    }
+
+    /// The `Authorization` header of the request at `index` — which is where the
+    /// token the viewer resolved becomes visible from outside.
+    pub fn authorization(&self, index: usize) -> String {
+        self.requests.lock().expect("stub request log")[index]
+            .authorization
+            .clone()
     }
 }
 
@@ -128,11 +146,12 @@ fn answer(
     mut stream: TcpStream,
     status: u16,
     resolve: &dyn Fn(&str) -> String,
-    requests: &Mutex<Vec<String>>,
+    requests: &Mutex<Vec<Request>>,
 ) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone stub connection"));
     let mut content_length = 0usize;
     let mut wants_gzip = false;
+    let mut authorization = String::new();
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
@@ -145,16 +164,23 @@ fn answer(
         if let Some(value) = lowered.strip_prefix("accept-encoding:") {
             wants_gzip = value.contains("gzip");
         }
+        if lowered.starts_with("authorization:") {
+            // From the original line, not the lowercased one: a token is
+            // case-sensitive.
+            authorization = line[line.find(':').unwrap_or_default() + 1..]
+                .trim()
+                .to_string();
+        }
     }
     let mut request_body = vec![0u8; content_length];
     let _ = reader.read_exact(&mut request_body);
     let request_body = String::from_utf8_lossy(&request_body).into_owned();
     // Recorded before the answer goes out, so a test that sees the response has
     // already seen the request.
-    requests
-        .lock()
-        .expect("stub request log")
-        .push(request_body.clone());
+    requests.lock().expect("stub request log").push(Request {
+        body: request_body.clone(),
+        authorization,
+    });
     let body = resolve(&request_body);
 
     let (payload, encoding) = if wants_gzip {
@@ -349,6 +375,48 @@ impl Drop for FixtureRepo {
     }
 }
 
+/// A plugin config directory in a temp dir — what `HERDR_PLUGIN_CONFIG_DIR`
+/// names, holding a real `config.toml` that the real parser reads.
+pub struct ConfigDir {
+    pub path: PathBuf,
+}
+
+impl ConfigDir {
+    /// A config directory with no `config.toml` in it: a fresh install, which
+    /// is what the defaults have to cover.
+    pub fn empty() -> Self {
+        let path = temp_dir("config-dir");
+        fs::create_dir_all(&path).expect("create the config directory");
+        Self { path }
+    }
+
+    /// A config directory holding this `config.toml`.
+    pub fn holding(contents: &str) -> Self {
+        let directory = Self::empty();
+        fs::write(directory.path.join("config.toml"), contents).expect("write config.toml");
+        directory
+    }
+
+    /// Another file in the same directory — a token file, say — and its path,
+    /// ready to be named from `config.toml`.
+    pub fn file(&self, name: &str, contents: &str) -> PathBuf {
+        let path = self.path.join(name);
+        fs::write(&path, contents).expect("write the file");
+        path
+    }
+
+    /// The config, loaded the way startup loads it.
+    pub fn config(&self) -> Config {
+        Config::load(Some(&self.path))
+    }
+}
+
+impl Drop for ConfigDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 fn temp_dir(prefix: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = format!(
@@ -362,16 +430,16 @@ fn temp_dir(prefix: &str) -> PathBuf {
 /// The environment description an app is constructed from in tests: a real
 /// workspace directory, the stub endpoint, a token that is never checked.
 ///
-/// No herdr socket and no overrides, which is the viewer running outside herdr.
-/// A test that wants either sets the field, the way it sets `token` to `None`.
+/// No herdr socket and no config file, which is the viewer running outside
+/// herdr on a fresh install. A test that wants either sets the field or folds a
+/// config in with [`Environment::with_config`], the way it sets `token` to
+/// `None`.
 pub fn environment(workspace_cwd: &Path, stub: &StubGithub) -> Environment {
     Environment {
         workspace_cwd: workspace_cwd.to_path_buf(),
-        herdr_socket: None,
-        workspace_id: None,
         graphql_url: stub.url.clone(),
         token: Some("test-token".to_string()),
-        slug_overrides: SlugOverrides::none(),
+        ..Environment::default()
     }
 }
 

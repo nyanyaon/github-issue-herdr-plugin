@@ -6,9 +6,11 @@
 //! exporting variables, which is what makes the app seam drivable.
 
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::config::{Config, ConfigWarning};
 use crate::identity::SlugOverrides;
 
 /// The GraphQL endpoint, unless [`Environment::GRAPHQL_URL_VAR`] overrides it.
@@ -37,11 +39,42 @@ pub struct Environment {
     /// The GitHub token, or `None` for the no-token status line.
     pub token: Option<String>,
     /// The `[repo."<repo_root>"] slug` overrides, ahead of `origin` in the
-    /// resolution order (ADR-0004).
-    ///
-    /// Empty here: the config file that fills it is a later ticket. This is the
-    /// shape it has to produce.
+    /// resolution order (ADR-0004). Filled from `config.toml`.
     pub slug_overrides: SlugOverrides,
+    /// `list_page_size` — how many issues the list query asks for.
+    pub list_page_size: u32,
+    /// `detail_comment_page_size` — how many comments one detail query asks for.
+    pub detail_comment_page_size: u32,
+    /// `prune_details_after_days`. Carried for the startup prune, which is a
+    /// later ticket; nothing in this slice deletes anything.
+    pub prune_details_after_days: u32,
+    /// `prune_repos_after_days`. Carried, as above.
+    pub prune_repos_after_days: u32,
+    /// Whatever `config.toml` got wrong. The app turns a non-empty list into the
+    /// one status line it has.
+    pub config_warnings: Vec<ConfigWarning>,
+}
+
+impl Default for Environment {
+    /// A viewer that has learned nothing from outside: no workspace, no herdr,
+    /// no token, and the config file's defaults everywhere else. Startup and the
+    /// tests both build on this and replace what they actually know.
+    fn default() -> Self {
+        let config = Config::default();
+        Self {
+            workspace_cwd: PathBuf::new(),
+            herdr_socket: None,
+            workspace_id: None,
+            graphql_url: DEFAULT_GRAPHQL_URL.to_string(),
+            token: None,
+            slug_overrides: config.slug_overrides,
+            list_page_size: config.list_page_size,
+            detail_comment_page_size: config.detail_comment_page_size,
+            prune_details_after_days: config.prune_details_after_days,
+            prune_repos_after_days: config.prune_repos_after_days,
+            config_warnings: config.warnings,
+        }
+    }
 }
 
 impl Environment {
@@ -54,8 +87,12 @@ impl Environment {
     /// Everything here is free: variables herdr already injected, plus at most
     /// one `gh` spawn for the token. The socket is not touched until the repo
     /// root is resolved.
+    /// `HERDR_PLUGIN_CONFIG_DIR`, which is where `config.toml` lives.
+    pub const CONFIG_DIR_VAR: &'static str = "HERDR_PLUGIN_CONFIG_DIR";
+
     pub fn from_process() -> Self {
         let context = plugin_context();
+        let config_dir = non_empty_var(Self::CONFIG_DIR_VAR).map(PathBuf::from);
         Self {
             workspace_cwd: workspace_cwd(context.as_ref()),
             herdr_socket: non_empty_var("HERDR_SOCKET_PATH").map(PathBuf::from),
@@ -66,10 +103,35 @@ impl Environment {
                 .filter(|url| !url.is_empty())
                 .unwrap_or_else(|| DEFAULT_GRAPHQL_URL.to_string()),
             token: discover_token(),
-            // The config file is a later ticket; until it lands no override is
-            // ever populated and resolution starts at `origin`.
-            slug_overrides: SlugOverrides::none(),
+            // Everything the config file decides keeps its default until the
+            // file is folded in below.
+            ..Self::default()
         }
+        .with_config(Config::load(config_dir.as_deref()))
+    }
+
+    /// Folds a loaded `config.toml` in, which is the last thing startup learns
+    /// from outside itself.
+    ///
+    /// It is applied *after* [`discover_token`] has run, because that is where
+    /// `token_file` sits in ADR-0005's order — `$GITHUB_TOKEN`, `$GH_TOKEN`,
+    /// `gh auth token`, then the file — so the file only ever supplies a token
+    /// nothing above it did. The path is read, never written: the viewer holds
+    /// no credential of its own.
+    ///
+    /// Tests apply a config parsed from a real file in a temp directory, which
+    /// is how every key reaches the app seam.
+    pub fn with_config(mut self, config: Config) -> Self {
+        self.list_page_size = config.list_page_size;
+        self.detail_comment_page_size = config.detail_comment_page_size;
+        self.prune_details_after_days = config.prune_details_after_days;
+        self.prune_repos_after_days = config.prune_repos_after_days;
+        self.slug_overrides = config.slug_overrides;
+        self.config_warnings = config.warnings;
+        self.token = self
+            .token
+            .or_else(|| config.token_file.as_deref().and_then(token_from_file));
+        self
     }
 }
 
@@ -98,10 +160,12 @@ fn non_empty_var(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-/// `$GITHUB_TOKEN`, then `$GH_TOKEN`, then `gh auth token`.
+/// The first three legs of ADR-0005's order: `$GITHUB_TOKEN`, then `$GH_TOKEN`,
+/// then `gh auth token`.
 ///
-/// The `token_file` config key is a later ticket; this slice has no config file.
-/// The viewer never writes a credential of its own.
+/// The fourth, `token_file`, needs the config file and so lives in
+/// [`Environment::with_config`], which runs after this. The viewer never writes
+/// a credential of its own.
 fn discover_token() -> Option<String> {
     for variable in ["GITHUB_TOKEN", "GH_TOKEN"] {
         if let Ok(token) = env::var(variable) {
@@ -117,4 +181,15 @@ fn discover_token() -> Option<String> {
     }
     let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!token.is_empty()).then_some(token)
+}
+
+/// The token in `token_file`: **the first line, trimmed**, so a file with a
+/// trailing newline or a comment under it still works.
+///
+/// Read-only, like everything else here — a file the user already owns and
+/// manages, that the viewer never writes to.
+pub fn token_from_file(path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    let token = contents.lines().next().unwrap_or_default().trim();
+    (!token.is_empty()).then(|| token.to_string())
 }
