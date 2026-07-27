@@ -1,6 +1,7 @@
 //! The pane's chrome. One column, one status line, never a modal.
 
 pub mod list;
+pub mod markdown;
 pub mod status;
 
 /// Truncates to `width` columns with an ellipsis, the way a list row's title is
