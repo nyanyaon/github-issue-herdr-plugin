@@ -475,13 +475,25 @@ impl Drop for StateDir {
 /// The app as the event loop reaches it once the pane has settled.
 ///
 /// [`App::start`] renders from the cache and asks nothing of the network;
-/// `main` draws that frame and only then runs the startup list query, which is
-/// what this second step is. A test that wants to see the frame *between* them
-/// drives [`App::start`] and [`App::run_pending_query`] itself.
+/// `main` draws that frame and only then does the startup work — the list
+/// query, and behind it the prune. A test that wants to see a frame *between*
+/// those drives [`App::start`] and [`App::run_pending_query`] itself, and calls
+/// [`settle`] when it wants the rest.
 pub fn start(environment: &Environment) -> App {
     let mut app = App::start(environment);
-    app.run_pending_query();
+    settle(&mut app);
     app
+}
+
+/// Runs the pane's queued work to a standstill: `main`'s loop with the drawing
+/// left out.
+///
+/// What is left when this returns is a pane blocked on input, which is where
+/// every assertion about "nothing is owed" belongs.
+pub fn settle(app: &mut App) {
+    while app.has_pending_query() {
+        app.run_pending_query();
+    }
 }
 
 /// Renders the app into a terminal test backend and returns the text on screen.
