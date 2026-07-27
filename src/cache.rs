@@ -20,7 +20,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::age;
-use crate::github::{IssueComment, IssueDetail, IssueList, IssueRow, IssueStates};
+use crate::github::{CommentPage, IssueComment, IssueDetail, IssueList, IssueRow, IssueStates};
 use crate::identity::Slug;
 
 /// The one database, in the state dir. Named by the plugin id through that
@@ -140,6 +140,22 @@ impl Cache {
     /// to, and the thread starts again at page one (ADR-0001).
     pub fn save_issue_detail(&self, slug: &Slug, detail: &IssueDetail) {
         let _ = self.write_issue_detail(slug, detail);
+    }
+
+    /// Caches one more page of an issue's comments, after the page that ended
+    /// at `after`.
+    ///
+    /// Pages are stored individually with their cursor, so a thread walked to
+    /// its end by one pane is read back whole by the next without a request.
+    ///
+    /// **Only ever appended to the page it actually follows**: the page that
+    /// ended at `after` has to still be there, and the new page's number is
+    /// that page's plus one. A re-fetch elsewhere that dropped the thread —
+    /// another pane's `r`, or its own stale re-fetch — therefore takes this
+    /// write with it rather than leaving a page orphaned behind a body it never
+    /// belonged to.
+    pub fn append_comment_page(&self, slug: &Slug, number: u64, after: &str, page: &CommentPage) {
+        let _ = self.write_comment_page(slug, number, after, page);
     }
 
     /// The `updatedAt` each cached detail of this repo was fetched at, by issue
@@ -381,6 +397,38 @@ impl Cache {
         )?;
         transaction.commit()
     }
+
+    /// One `INSERT … SELECT`, which is what makes the append conditional: the
+    /// row it selects from *is* the page being continued, so a thread that was
+    /// dropped between the fetch and this write selects nothing and inserts
+    /// nothing.
+    fn write_comment_page(
+        &self,
+        slug: &Slug,
+        number: u64,
+        after: &str,
+        page: &CommentPage,
+    ) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "INSERT INTO issue_comments (slug, number, page, nodes_json, end_cursor, has_next)
+             SELECT ?1, ?2, previous.page + 1, ?4, ?5, ?6
+               FROM issue_comments previous
+              WHERE previous.slug = ?1 AND previous.number = ?2
+                AND previous.end_cursor = ?3 AND previous.has_next != 0
+             ON CONFLICT(slug, number, page) DO UPDATE SET nodes_json = excluded.nodes_json,
+                                                          end_cursor = excluded.end_cursor,
+                                                          has_next = excluded.has_next",
+            params![
+                slug.to_string(),
+                number as i64,
+                after,
+                serde_json::to_string(&page.comments).unwrap_or_else(|_| "[]".to_string()),
+                page.end_cursor,
+                page.has_more_comments as i64,
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 /// The `state` column a set of states matches, or `NULL` for all of them.
@@ -527,29 +575,27 @@ mod tests {
         assert_eq!(read.fetched_at, 1_785_143_643);
     }
 
+    /// The page `[m]ore` fetches once the thread has been opened on its first.
+    fn second_page() -> CommentPage {
+        CommentPage {
+            comments: vec![IssueComment {
+                author: Some("octocat".to_string()),
+                created_at: None,
+                body: "The hundred and first.".to_string(),
+            }],
+            has_more_comments: false,
+            end_cursor: Some("Y3Vyc29yOnYyOpHOBB".to_string()),
+        }
+    }
+
     /// Re-fetching an issue drops **every** page cached for it, not just the
     /// one it replaces, and starts the thread again at page one (ADR-0001).
-    ///
-    /// Only the first page is ever fetched so far, so the second page here is
-    /// written straight into the table — the same standing this file's
-    /// migration test has, which asserts against a schema step that does not
-    /// exist yet either.
     #[test]
     fn a_re_fetch_drops_every_comment_page_and_starts_again_at_the_first() {
         let cache = Cache::open_at(&temp_database("pages")).expect("open the cache");
         cache.save_issue_list(&slug(), &list_with_one_row());
         cache.save_issue_detail(&slug(), &detail_with_comments());
-        cache
-            .connection
-            .execute(
-                "INSERT INTO issue_comments (slug, number, page, nodes_json, end_cursor, has_next)
-                 VALUES (?1, 7, 2, ?2, 'Y3Vyc29yOnYyOpHOBB', 0)",
-                params![
-                    slug().to_string(),
-                    r#"[{"author":"octocat","created_at":null,"body":"The hundred and first."}]"#,
-                ],
-            )
-            .expect("cache a second page the way paging would");
+        cache.append_comment_page(&slug(), 7, "Y3Vyc29yOnYyOpHOAA", &second_page());
         assert_eq!(
             cache
                 .issue_detail(&slug(), 7)
@@ -588,6 +634,86 @@ mod tests {
         assert_eq!(read.comments[0].body, "The first of many, edited.");
         assert!(!read.has_more_comments);
         assert_eq!(read.comments_end_cursor, None);
+    }
+
+    /// Pages are rows, not a growing blob: each one is cached under its own
+    /// page number with the cursor it ended at, which is the only thing the
+    /// page after it can be asked for with.
+    #[test]
+    fn each_fetched_page_is_cached_as_its_own_row_with_its_cursor() {
+        let cache = Cache::open_at(&temp_database("page-rows")).expect("open the cache");
+        cache.save_issue_list(&slug(), &list_with_one_row());
+        cache.save_issue_detail(&slug(), &detail_with_comments());
+
+        cache.append_comment_page(&slug(), 7, "Y3Vyc29yOnYyOpHOAA", &second_page());
+
+        let pages: Vec<(i64, Option<String>, i64)> = cache
+            .connection
+            .prepare(
+                "SELECT page, end_cursor, has_next FROM issue_comments
+                 WHERE slug = ?1 AND number = 7 ORDER BY page",
+            )
+            .expect("read the cached pages")
+            .query_map(params![slug().to_string()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .expect("read the cached pages")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("read the cached pages");
+
+        assert_eq!(
+            pages,
+            vec![
+                (1, Some("Y3Vyc29yOnYyOpHOAA".to_string()), 1),
+                (2, Some("Y3Vyc29yOnYyOpHOBB".to_string()), 0),
+            ],
+            "one row per page, each with the cursor it ended at"
+        );
+
+        let read = cache.issue_detail(&slug(), 7).expect("the two-page thread");
+        assert_eq!(read.comments.len(), 2, "read back as one thread, in order");
+        assert_eq!(read.comments[0].body, "The first of many.");
+        assert_eq!(read.comments[1].body, "The hundred and first.");
+        assert!(!read.has_more_comments, "the last page ends the thread");
+        assert_eq!(
+            read.comments_end_cursor.as_deref(),
+            Some("Y3Vyc29yOnYyOpHOBB"),
+            "and the cursor is the last page's"
+        );
+    }
+
+    /// The append is keyed on the page it continues, so a page fetched against
+    /// a thread that has since been dropped is dropped with it rather than
+    /// cached behind a body it never belonged to.
+    ///
+    /// This is the shape of the race between two panes on one repo: one walks a
+    /// thread while the other re-fetches the issue underneath it.
+    #[test]
+    fn a_page_is_not_appended_to_a_thread_that_is_no_longer_there() {
+        let cache = Cache::open_at(&temp_database("orphan")).expect("open the cache");
+        cache.save_issue_list(&slug(), &list_with_one_row());
+        cache.save_issue_detail(&slug(), &detail_with_comments());
+
+        // The other pane's re-fetch: the thread restarts, at a cursor of its
+        // own.
+        let mut re_fetched = detail_with_comments();
+        re_fetched.comments_end_cursor = Some("Y3Vyc29yOnYyOpHOCC".to_string());
+        cache.save_issue_detail(&slug(), &re_fetched);
+
+        // This pane's `m`, asked for with the cursor it was holding.
+        cache.append_comment_page(&slug(), 7, "Y3Vyc29yOnYyOpHOAA", &second_page());
+
+        let read = cache.issue_detail(&slug(), 7).expect("the cached detail");
+        assert_eq!(
+            read.comments.len(),
+            1,
+            "the orphaned page was not resurrected"
+        );
+        assert_eq!(
+            read.comments_end_cursor.as_deref(),
+            Some("Y3Vyc29yOnYyOpHOCC"),
+            "and the thread still stands where the re-fetch left it"
+        );
     }
 
     /// The other half of the staleness comparison, straight off the table it is
