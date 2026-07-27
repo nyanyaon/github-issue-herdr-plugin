@@ -7,6 +7,7 @@ use std::fmt;
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use crate::age;
@@ -25,6 +26,24 @@ query($owner:String!,$name:String!,$states:[IssueState!],$first:Int!,$after:Stri
       pageInfo{hasNextPage endCursor}
       nodes{number title state updatedAt comments{totalCount}
             author{login} labels(first:10){nodes{name color}}}
+    }
+  }
+}";
+
+/// The detail query: one issue, its body, and one page of comments.
+///
+/// `first` is the comment page size, and one page is all this slice fetches —
+/// the `[m]ore` affordance for longer threads is a later ticket.
+const ISSUE_DETAIL_QUERY: &str = r"
+query($owner:String!,$name:String!,$number:Int!,$first:Int!,$after:String){
+  repository(owner:$owner,name:$name){
+    issue(number:$number){
+      number title body state createdAt updatedAt author{login}
+      labels(first:20){nodes{name color}}
+      comments(first:$first,after:$after){
+        totalCount pageInfo{hasNextPage endCursor}
+        nodes{author{login} createdAt body}
+      }
     }
   }
 }";
@@ -58,6 +77,46 @@ pub struct IssueList {
     pub rows: Vec<IssueRow>,
     /// When this list was fetched, in unix seconds.
     pub fetched_at: i64,
+}
+
+/// One comment of an issue detail, in the order it was written.
+#[derive(Debug, Clone)]
+pub struct IssueComment {
+    pub author: Option<String>,
+    /// When the comment was written, in unix seconds.
+    pub created_at: Option<i64>,
+    /// Markdown, rendered at draw time against the pane's current width.
+    pub body: String,
+}
+
+/// The issue detail: body plus the comments fetched so far.
+///
+/// Cached separately from the list, and separately invalidated — but the cache
+/// itself is a later ticket, so for now this lives only as long as the view.
+#[derive(Debug, Clone)]
+pub struct IssueDetail {
+    pub number: u64,
+    pub title: String,
+    /// Markdown, rendered at draw time against the pane's current width.
+    pub body: String,
+    pub state: String,
+    pub updated_at: Option<i64>,
+    pub author: Option<String>,
+    pub labels: Vec<String>,
+    /// How many comments the issue has, not how many arrived.
+    pub comment_total_count: u64,
+    pub comments: Vec<IssueComment>,
+    /// Whether comments remain beyond the ones fetched.
+    pub has_more_comments: bool,
+    /// When this detail was fetched, in unix seconds.
+    pub fetched_at: i64,
+}
+
+impl IssueDetail {
+    /// The first label, which is all the header line has room for.
+    pub fn first_label(&self) -> Option<&str> {
+        self.labels.first().map(String::as_str)
+    }
 }
 
 /// Every way the API can fail. Each one is a single status line; nothing
@@ -133,12 +192,44 @@ impl GithubClient {
             }
         });
 
+        let envelope: Envelope<Repository> = self.post(&body)?;
+        envelope.into_issue_list(slug)
+    }
+
+    /// One issue's body and its first page of comments.
+    ///
+    /// User-initiated only: `enter` on a row, and `n`/`p` from inside the detail
+    /// view. Nothing else fetches, and nothing retries by itself.
+    pub fn issue_detail(
+        &self,
+        slug: &Slug,
+        number: u64,
+        comment_page_size: u32,
+    ) -> Result<IssueDetail, ApiError> {
+        let body = json!({
+            "query": ISSUE_DETAIL_QUERY,
+            "variables": {
+                "owner": slug.owner,
+                "name": slug.name,
+                "number": number,
+                "first": comment_page_size,
+                // Paging past the first hundred comments is a later ticket.
+                "after": serde_json::Value::Null,
+            }
+        });
+
+        let envelope: Envelope<RepositoryDetail> = self.post(&body)?;
+        envelope.into_issue_detail(slug, number)
+    }
+
+    /// One POST, one response, one status mapping — shared by both queries.
+    fn post<R: DeserializeOwned>(&self, body: &serde_json::Value) -> Result<Envelope<R>, ApiError> {
         let mut response = self
             .agent
             .post(&self.url)
             .header("Authorization", format!("Bearer {}", self.token))
             .header("Accept", "application/json")
-            .send_json(&body)
+            .send_json(body)
             .map_err(|_| ApiError::Offline)?;
 
         let status = response.status().as_u16();
@@ -160,45 +251,55 @@ impl GithubClient {
             });
         }
 
-        let envelope: Envelope =
-            response
-                .body_mut()
-                .read_json()
-                .map_err(|error| ApiError::Unexpected {
-                    message: error.to_string(),
-                })?;
-        envelope.into_issue_list(slug)
+        response
+            .body_mut()
+            .read_json()
+            .map_err(|error| ApiError::Unexpected {
+                message: error.to_string(),
+            })
     }
 }
 
+/// A GraphQL response body, generic over the shape of `data.repository` — the
+/// two queries differ only there.
 #[derive(Debug, Deserialize)]
-struct Envelope {
-    #[serde(default)]
-    data: Option<Data>,
+struct Envelope<R> {
+    #[serde(default = "Option::default")]
+    data: Option<Data<R>>,
     #[serde(default)]
     errors: Vec<GraphqlError>,
 }
 
-impl Envelope {
+impl<R> Envelope<R> {
+    /// The repository the response carried, or the error it carried instead.
+    ///
+    /// `NOT_FOUND` covers both a missing repo and one this token cannot see;
+    /// the API cannot distinguish them, so neither can the message.
+    fn into_repository(self, missing: &str) -> Result<R, ApiError> {
+        if let Some(repository) = self.data.and_then(|data| data.repository) {
+            return Ok(repository);
+        }
+        let not_found = self
+            .errors
+            .iter()
+            .any(|error| error.error_type.as_deref() == Some("NOT_FOUND"));
+        if not_found {
+            return Err(ApiError::NotFound {
+                slug: missing.to_string(),
+            });
+        }
+        let message = self
+            .errors
+            .first()
+            .map(|error| error.message.clone())
+            .unwrap_or_else(|| "empty response".to_string());
+        Err(ApiError::Unexpected { message })
+    }
+}
+
+impl Envelope<Repository> {
     fn into_issue_list(self, slug: &Slug) -> Result<IssueList, ApiError> {
-        let repository = self.data.and_then(|data| data.repository);
-        let Some(repository) = repository else {
-            let not_found = self
-                .errors
-                .iter()
-                .any(|error| error.error_type.as_deref() == Some("NOT_FOUND"));
-            if not_found {
-                return Err(ApiError::NotFound {
-                    slug: slug.to_string(),
-                });
-            }
-            let message = self
-                .errors
-                .first()
-                .map(|error| error.message.clone())
-                .unwrap_or_else(|| "empty response".to_string());
-            return Err(ApiError::Unexpected { message });
-        };
+        let repository = self.into_repository(&slug.to_string())?;
 
         let rows = repository
             .issues
@@ -240,8 +341,8 @@ struct GraphqlError {
 }
 
 #[derive(Debug, Deserialize)]
-struct Data {
-    repository: Option<Repository>,
+struct Data<R> {
+    repository: Option<R>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -291,4 +392,93 @@ struct Labels {
 #[derive(Debug, Deserialize)]
 struct Label {
     name: String,
+}
+
+impl Envelope<RepositoryDetail> {
+    fn into_issue_detail(self, slug: &Slug, number: u64) -> Result<IssueDetail, ApiError> {
+        let missing = format!("{slug}#{number}");
+        let repository = self.into_repository(&missing)?;
+        // A repo that exists but has no such issue reads the same way: the
+        // number is not there, or not visible to this token.
+        let issue = repository
+            .issue
+            .ok_or(ApiError::NotFound { slug: missing })?;
+
+        let comments = issue
+            .comments
+            .nodes
+            .into_iter()
+            .flatten()
+            .map(|node| IssueComment {
+                author: node.author.map(|author| author.login),
+                created_at: node.created_at.as_deref().and_then(age::parse_timestamp),
+                body: node.body,
+            })
+            .collect();
+
+        Ok(IssueDetail {
+            number: issue.number,
+            title: issue.title,
+            body: issue.body,
+            state: issue.state,
+            updated_at: issue.updated_at.as_deref().and_then(age::parse_timestamp),
+            author: issue.author.map(|author| author.login),
+            labels: issue
+                .labels
+                .nodes
+                .into_iter()
+                .flatten()
+                .map(|label| label.name)
+                .collect(),
+            comment_total_count: issue.comments.total_count,
+            comments,
+            has_more_comments: issue.comments.page_info.has_next_page,
+            fetched_at: age::now(),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RepositoryDetail {
+    issue: Option<IssueDetailNode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueDetailNode {
+    number: u64,
+    title: String,
+    #[serde(default)]
+    body: String,
+    state: String,
+    updated_at: Option<String>,
+    author: Option<Author>,
+    labels: Labels,
+    comments: Comments,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Comments {
+    total_count: u64,
+    #[serde(default)]
+    page_info: PageInfo,
+    #[serde(default)]
+    nodes: Vec<Option<CommentNode>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PageInfo {
+    #[serde(default)]
+    has_next_page: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommentNode {
+    author: Option<Author>,
+    created_at: Option<String>,
+    #[serde(default)]
+    body: String,
 }
