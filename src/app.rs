@@ -270,19 +270,29 @@ impl App {
 ///
 /// The query is matched against the number, the title, every label and the
 /// author at once, so `42`, `#42`, `walking`, `map` and `nyanyaon` all find
-/// something without a mode or a prefix. Matching is a case-insensitive
-/// substring per field rather than a subsequence: a fragment of a title is what
-/// people type, and a subsequence match over fifty rows lets almost everything
-/// through on the first keystroke.
+/// something without a mode or a prefix. Matching is fuzzy per ADR-0002: the
+/// query's characters must appear in the field in order, but need not be
+/// adjacent, so `wskel` finds `Walking skeleton`. It is case-insensitive, and a
+/// short query deliberately keeps a lot of rows — the next keystroke narrows it,
+/// and rows stay in `updatedAt` order rather than being reordered by score.
 fn matches_filter(row: &IssueRow, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
     let query = query.to_lowercase();
-    let field_matches = |field: &str| field.to_lowercase().contains(&query);
+    let field_matches = |field: &str| is_subsequence(&query, &field.to_lowercase());
 
     field_matches(&format!("#{}", row.number))
         || field_matches(&row.title)
         || row.labels.iter().any(|label| field_matches(label))
         || row.author.as_deref().is_some_and(field_matches)
+}
+
+/// Do `query`'s characters occur in `field`, in order but not necessarily
+/// adjacent? Both sides are already lowercased by the caller.
+fn is_subsequence(query: &str, field: &str) -> bool {
+    let mut field = field.chars();
+    query
+        .chars()
+        .all(|wanted| field.any(|character| character == wanted))
 }

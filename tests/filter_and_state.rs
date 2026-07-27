@@ -120,6 +120,34 @@ fn slash_filters_on_title_number_label_and_author_at_once() {
     }
 }
 
+/// ADR-0002 asks for a *fuzzy* filter, not a substring one: the characters must
+/// appear in order, but the gaps between them are free. Every query here spans a
+/// gap, so a substring matcher would show nothing.
+#[test]
+fn the_filter_is_fuzzy_rather_than_a_substring() {
+    let repo = FixtureRepo::with_origin(REMOTE);
+    let stub = StubGithub::serving(issue_list(three_issues()));
+
+    for (query, expected) in [
+        ("wskel", 42),  // "Walking skeleton", across the space
+        ("pnui", 7),    // "Pane UI", initials of both words
+        ("tkdisc", 11), // "Token discovery", letters dropped from each word
+        ("ptype", 7),   // the "prototype" label, missing its middle
+        ("ocat", 42),   // the "octocat" author, missing its middle
+    ] {
+        let mut app = App::start(&environment(&repo.path, &stub));
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, query);
+
+        let screen = screen(&app, 72, 10);
+        assert_eq!(
+            numbers_on_screen(&screen),
+            vec![expected],
+            "{query:?} should fuzzy-match only #{expected} in:\n{screen}"
+        );
+    }
+}
+
 #[test]
 fn the_header_counts_the_filtered_rows_against_the_total() {
     let repo = FixtureRepo::with_origin(REMOTE);
