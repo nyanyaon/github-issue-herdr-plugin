@@ -196,12 +196,14 @@ impl fmt::Display for ApiError {
                 "token rejected · check GITHUB_TOKEN or run `gh auth login`"
             ),
             Self::NotFound { slug } => write!(f, "{slug} not found — or your token can't see it"),
+            // `[r] retry` because nothing retries by itself: the way out of a
+            // rate limit is a keystroke, and the line has to say so.
             Self::RateLimited {
                 resets_in_minutes: Some(minutes),
-            } => write!(f, "rate limited · resets in {minutes}m"),
+            } => write!(f, "rate limited · resets in {minutes}m · [r] retry"),
             Self::RateLimited {
                 resets_in_minutes: None,
-            } => write!(f, "rate limited"),
+            } => write!(f, "rate limited · [r] retry"),
             Self::Offline => write!(f, "offline · could not reach the GitHub API"),
             Self::Unexpected { message } => write!(f, "github error · {message}"),
         }
@@ -296,13 +298,16 @@ impl GithubClient {
             return Err(ApiError::TokenRejected);
         }
         if status == 403 || status == 429 {
-            let resets_in_minutes = response
-                .headers()
-                .get("x-ratelimit-reset")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<i64>().ok())
-                .map(|reset| ((reset - age::now()).max(0) + 59) / 60);
-            return Err(ApiError::RateLimited { resets_in_minutes });
+            let headers = response.headers();
+            let header = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.trim().parse::<i64>().ok())
+            };
+            if let Some(rate_limited) = rate_limited(header, age::now()) {
+                return Err(rate_limited);
+            }
         }
         if !(200..300).contains(&status) {
             return Err(ApiError::Unexpected {
@@ -316,6 +321,36 @@ impl GithubClient {
             .map_err(|error| ApiError::Unexpected {
                 message: error.to_string(),
             })
+    }
+}
+
+/// Is this 403 or 429 the rate limiter talking, and when does it lift?
+///
+/// The rate-limit headers are read **here and nowhere else**, and only on a
+/// response that already failed — which is the whole of ADR-0005's "remaining
+/// quota is displayed only when a request is actually rate-limited". A
+/// successful response's `x-ratelimit-remaining` is never looked at, so there is
+/// no path by which a quota could reach the screen at any other time.
+///
+/// Both forms GitHub sends: `x-ratelimit-reset` is the primary limit's absolute
+/// unix second, `retry-after` the secondary limit's delay in seconds. A 403
+/// carrying neither is not the rate limiter — it is a forbidden request, and
+/// answering "rate limited" would send the user to wait out a clock that is not
+/// running.
+fn rate_limited(header: impl Fn(&str) -> Option<i64>, now: i64) -> Option<ApiError> {
+    let minutes = |seconds: i64| (seconds.max(0) + 59) / 60;
+    let resets_in_minutes = header("x-ratelimit-reset")
+        .map(|reset| minutes(reset - now))
+        .or_else(|| header("retry-after").map(minutes));
+    match resets_in_minutes {
+        Some(minutes) => Some(ApiError::RateLimited {
+            resets_in_minutes: Some(minutes),
+        }),
+        // Exhausted, but with nothing that says when it lifts.
+        None if header("x-ratelimit-remaining") == Some(0) => Some(ApiError::RateLimited {
+            resets_in_minutes: None,
+        }),
+        None => None,
     }
 }
 
