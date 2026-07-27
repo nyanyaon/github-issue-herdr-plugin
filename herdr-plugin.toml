@@ -1,0 +1,16 @@
+id = "nyanyaon.herdr-issues"
+name = "GitHub Issues"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Read GitHub issues for the active workspace's repo, in a pane"
+platforms = ["linux", "macos"]
+
+# The pane command's working directory is the plugin root, so the relative path
+# resolves. `cargo build --release && install -D target/release/herdr-issues
+# bin/herdr-issues` is the dev loop; the fetch-or-build install script is a
+# later ticket.
+[[panes]]
+id = "issues"
+title = "Issues"
+placement = "split"
+command = ["./bin/herdr-issues"]
