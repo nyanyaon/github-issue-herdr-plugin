@@ -460,6 +460,9 @@ impl App {
         let (Some(client), Some(identity)) = (self.client.as_ref(), self.identity.as_ref()) else {
             return;
         };
+        // Read before the request, because a failure changes nothing on screen:
+        // whatever age was being shown is the age still being shown.
+        let cached_at = self.cached_at_on_screen();
         let fetched = client.issue_detail(&identity.slug, number, self.detail_comment_page_size);
 
         match fetched {
@@ -474,8 +477,22 @@ impl App {
                 self.show_detail(detail, index);
                 self.status = None;
             }
-            Err(error) => self.status = Some(StatusLine::Api(error)),
+            Err(error) => self.status = Some(StatusLine::api(error, cached_at)),
         }
+    }
+
+    /// When the data currently on screen was fetched — the age the offline line
+    /// states, since what a failed fetch leaves behind *is* the cache.
+    ///
+    /// Whichever view is up answers for itself: the issue being read in the
+    /// detail view, the rows underneath it otherwise. `None` is a cold start
+    /// with nothing cached, where there is no age to state.
+    fn cached_at_on_screen(&self) -> Option<i64> {
+        match self.view {
+            View::Detail => self.detail.as_ref().map(|detail| detail.fetched_at),
+            View::List => None,
+        }
+        .or_else(|| self.issue_list.as_ref().map(|list| list.fetched_at))
     }
 
     /// Is this row's cached detail behind the list — the `●` of SPEC §11?
@@ -553,6 +570,9 @@ impl App {
         let (Some(client), Some(identity)) = (self.client.as_ref(), self.identity.as_ref()) else {
             return false;
         };
+        // As in [`App::fetch_detail`]: the age of what a failure would leave on
+        // screen, read while it is still unambiguously the age on screen.
+        let cached_at = self.cached_at_on_screen();
         let result = client.issue_list(&identity.slug, self.states, self.list_page_size);
         let fetched = match result {
             Ok(list) => {
@@ -569,7 +589,7 @@ impl App {
                 true
             }
             Err(error) => {
-                self.status = Some(StatusLine::Api(error));
+                self.status = Some(StatusLine::api(error, cached_at));
                 false
             }
         };

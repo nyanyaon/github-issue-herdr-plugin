@@ -233,8 +233,8 @@ fn a_warm_start_whose_refresh_fails_keeps_the_cached_rows_on_screen() {
         "a failed fetch never clears the cache:\n{screen}"
     );
     assert!(
-        screen.contains("offline · could not reach the GitHub API"),
-        "the failure is one status line:\n{screen}"
+        screen.contains("offline · showing cache from just now"),
+        "the failure is one status line, and it names the age of what it left:\n{screen}"
     );
     assert!(
         screen.contains("fetched"),
