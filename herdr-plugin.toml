@@ -24,3 +24,18 @@ id = "issues"
 title = "Issues"
 placement = "split"
 command = ["./bin/herdr-issues"]
+
+# A keybinding of type `plugin_action` resolves an action id, never a pane
+# entrypoint id — verified against herdr 0.7.5, where binding the pane directly
+# answers `plugin_action_not_found`. So the bindable surface is this one-shot
+# action, which asks herdr to open the pane above. It is the only reason the
+# action exists; nothing else invokes it, and it holds no logic of its own.
+[[actions]]
+id = "open"
+title = "Open issues pane"
+contexts = ["workspace"]
+command = [
+  "/bin/sh",
+  "-c",
+  "\"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint issues",
+]
