@@ -5,10 +5,20 @@ min_herdr_version = "0.7.0"
 description = "Read GitHub issues for the active workspace's repo, in a pane"
 platforms = ["linux", "macos"]
 
+# Runs on `herdr plugin install` only — never on `herdr plugin link`, so the dev
+# loop never sees it — after the user has confirmed the install preview, and a
+# failure aborts the install. It gets no socket and no runtime environment.
+#
+# The script fetches the prebuilt for this `version` and the detected target and
+# falls back to `cargo build --release`, so an installing user needs neither a
+# Rust toolchain nor the C compiler `rusqlite`'s bundled SQLite would otherwise
+# demand (ADR-0003).
+[[build]]
+platforms = ["linux", "macos"]
+command = ["/bin/sh", "scripts/fetch-or-build.sh"]
+
 # The pane command's working directory is the plugin root, so the relative path
-# resolves. `cargo build --release && install -D target/release/herdr-issues
-# bin/herdr-issues` is the dev loop; the fetch-or-build install script is a
-# later ticket.
+# resolves to whatever `scripts/fetch-or-build.sh` put there.
 [[panes]]
 id = "issues"
 title = "Issues"
