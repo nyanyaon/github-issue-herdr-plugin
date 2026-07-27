@@ -443,6 +443,47 @@ pub fn environment(workspace_cwd: &Path, stub: &StubGithub) -> Environment {
     }
 }
 
+/// A plugin state directory in a temp dir — what `HERDR_PLUGIN_STATE_DIR`
+/// names, holding the one real SQLite database every pane shares.
+///
+/// A test that wants a cache at all makes one of these; the environment above
+/// deliberately has none, which is the viewer running outside herdr.
+pub struct StateDir {
+    pub path: PathBuf,
+}
+
+impl StateDir {
+    pub fn empty() -> Self {
+        let path = temp_dir("state-dir");
+        fs::create_dir_all(&path).expect("create the state directory");
+        Self { path }
+    }
+
+    /// The database file the viewer keeps in it — named so a test can assert it
+    /// is the one file, and that it is there.
+    pub fn database(&self) -> PathBuf {
+        self.path.join(herdr_issues::cache::FILE_NAME)
+    }
+}
+
+impl Drop for StateDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// The app as the event loop reaches it once the pane has settled.
+///
+/// [`App::start`] renders from the cache and asks nothing of the network;
+/// `main` draws that frame and only then runs the startup list query, which is
+/// what this second step is. A test that wants to see the frame *between* them
+/// drives [`App::start`] and [`App::run_pending_query`] itself.
+pub fn start(environment: &Environment) -> App {
+    let mut app = App::start(environment);
+    app.run_pending_query();
+    app
+}
+
 /// Renders the app into a terminal test backend and returns the text on screen.
 pub fn screen(app: &App, width: u16, height: u16) -> String {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");

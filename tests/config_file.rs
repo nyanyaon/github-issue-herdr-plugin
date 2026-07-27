@@ -15,7 +15,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use herdr_issues::app::App;
 use herdr_issues::environment::Environment;
 use serde_json::{Value, json};
-use support::{ConfigDir, FixtureRepo, StubGithub, environment, screen, seconds_ago};
+use support::{ConfigDir, FixtureRepo, StubGithub, environment, screen, seconds_ago, start};
 
 const REMOTE: &str = "https://github.com/nyanyaon/github-issue-herdr-plugin";
 const SLUG: &str = "nyanyaon/github-issue-herdr-plugin";
@@ -105,7 +105,7 @@ fn assert_queried(screen: &str, slug: &str) {
 
 /// Wide enough that a status line naming a path is never clipped.
 fn pane(environment: &Environment) -> String {
-    screen(&App::start(environment), 120, 12)
+    screen(&start(environment), 120, 12)
 }
 
 fn press(app: &mut App, code: KeyCode) {
@@ -143,7 +143,7 @@ fn with_no_config_file_the_documented_defaults_apply_and_nothing_is_reported() {
     // A fresh install: the directory exists, the file does not.
     let config = ConfigDir::empty();
     let stub = stub();
-    let mut app = App::start(&environment(&repo.path, &stub).with_config(config.config()));
+    let mut app = start(&environment(&repo.path, &stub).with_config(config.config()));
     press(&mut app, KeyCode::Enter);
 
     let list = squeeze(&stub.request(0));
@@ -163,7 +163,7 @@ fn the_page_sizes_come_from_the_file() {
     let repo = FixtureRepo::with_origin(REMOTE);
     let config = ConfigDir::holding("list_page_size = 5\ndetail_comment_page_size = 7\n");
     let stub = stub();
-    let mut app = App::start(&environment(&repo.path, &stub).with_config(config.config()));
+    let mut app = start(&environment(&repo.path, &stub).with_config(config.config()));
     press(&mut app, KeyCode::Enter);
 
     let list = squeeze(&stub.request(0));
@@ -204,7 +204,7 @@ fn token_file_supplies_the_token_when_nothing_above_it_did() {
     // Neither variable is set and `gh` had nothing, which is the only situation
     // in which the file is consulted at all.
     environment.token = None;
-    let app = App::start(&environment.with_config(config.config()));
+    let app = start(&environment.with_config(config.config()));
 
     assert_eq!(stub.authorization(0), "Bearer file-token");
     let screen = screen(&app, 120, 12);
@@ -299,7 +299,7 @@ fn a_malformed_file_falls_back_to_defaults_with_a_warning_rather_than_refusing_t
     let repo = FixtureRepo::with_origin(REMOTE);
     let config = ConfigDir::holding("list_page_size = 5\nthis is not toml at all\n");
     let stub = stub();
-    let app = App::start(&environment(&repo.path, &stub).with_config(config.config()));
+    let app = start(&environment(&repo.path, &stub).with_config(config.config()));
 
     // The pane opened, the list is on screen, and the file's one good key went
     // with the rest of it: a file that will not parse is not half-applied.
@@ -318,7 +318,7 @@ fn an_unknown_key_warns_and_is_ignored_while_the_rest_of_the_file_still_applies(
     let repo = FixtureRepo::with_origin(REMOTE);
     let config = ConfigDir::holding("colour = \"blue\"\nlist_page_size = 3\n");
     let stub = stub();
-    let app = App::start(&environment(&repo.path, &stub).with_config(config.config()));
+    let app = start(&environment(&repo.path, &stub).with_config(config.config()));
 
     let list = squeeze(&stub.request(0));
     assert!(list.contains("\"first\":3"), "{list}");
@@ -338,7 +338,7 @@ fn a_key_carrying_the_wrong_kind_of_value_costs_only_itself() {
     let repo = FixtureRepo::with_origin(REMOTE);
     let config = ConfigDir::holding("list_page_size = \"fifty\"\ndetail_comment_page_size = 7\n");
     let stub = stub();
-    let mut app = App::start(&environment(&repo.path, &stub).with_config(config.config()));
+    let mut app = start(&environment(&repo.path, &stub).with_config(config.config()));
     press(&mut app, KeyCode::Enter);
 
     let list = squeeze(&stub.request(0));

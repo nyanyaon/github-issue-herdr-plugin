@@ -10,6 +10,7 @@ use std::cell::Cell;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 
+use crate::cache::Cache;
 use crate::environment::Environment;
 use crate::github::{ApiError, GithubClient, IssueDetail, IssueList, IssueRow, IssueStates};
 use crate::identity::RepoIdentity;
@@ -46,6 +47,17 @@ pub struct App {
     /// and `p` can fetch a detail, without resolving the identity or the token
     /// again. It holds no connection and does no work between calls.
     client: Option<GithubClient>,
+    /// The shared cache, or `None` when there is no state dir to keep one in.
+    /// Held open for the pane's lifetime; it costs one file handle and does no
+    /// work between calls.
+    cache: Option<Cache>,
+    /// The list query SPEC §5 step 6 runs *after* the cached rows are on screen.
+    ///
+    /// It is a flag rather than a call inside [`App::start`] because the frame
+    /// between the two is the whole point: the event loop draws, sees this, runs
+    /// the query, and draws again. Once it is cleared nothing sets it again in
+    /// this slice, so the pane goes back to blocking on input.
+    pending_list_query: bool,
     states: IssueStates,
     issue_list: Option<IssueList>,
     detail: Option<IssueDetail>,
@@ -71,15 +83,24 @@ pub struct App {
 }
 
 impl App {
-    /// Resolves the repo identity, then issues the issue list query — once.
+    /// Everything SPEC §5 does *before* the network: the repo identity, the
+    /// cache, the token, and the cached rows put on screen.
     ///
-    /// After this returns the process holds no timer, thread or subscription: it
-    /// blocks on terminal input between renders, and the only thing that can
-    /// make it query again is a keystroke asking it to (`o`).
+    /// It issues no request. The app it returns is the first frame a user sees,
+    /// and it leaves [`App::has_pending_query`] set so that the event loop draws
+    /// that frame and only then runs the list query. That ordering is the whole
+    /// of cache-first rendering: it is structural here, not a promise made in a
+    /// comment.
+    ///
+    /// After [`App::run_pending_query`] the process holds no timer, thread or
+    /// subscription: it blocks on terminal input between renders, and the only
+    /// thing that can make it query again is a keystroke asking it to.
     pub fn start(environment: &Environment) -> Self {
         let mut app = Self {
             identity: None,
             client: None,
+            cache: None,
+            pending_list_query: false,
             states: IssueStates::default(),
             issue_list: None,
             detail: None,
@@ -107,14 +128,59 @@ impl App {
         };
         app.identity = Some(identity);
 
+        // SPEC §5 step 4: the cache opens before the token is resolved, so that
+        // a pane with no token still has something to show. The startup prune
+        // that belongs beside this is a later ticket.
+        app.cache = Cache::open(environment.state_dir.as_deref());
+        app.load_cached_list();
+
         let Some(token) = environment.token.clone() else {
+            // Cached rows stay on screen underneath it: a missing token is a
+            // status line, not an empty pane.
             app.status = Some(StatusLine::Api(ApiError::NoToken));
             return app;
         };
 
         app.client = Some(GithubClient::new(environment.graphql_url.clone(), token));
-        let _ = app.refresh_list();
+        app.pending_list_query = true;
+        if app.issue_list.is_none() {
+            // A cold start has no rows to draw, so the one line it can honestly
+            // show is what it is doing. Never a skeleton of rows that may not
+            // exist.
+            app.status = Some(StatusLine::Fetching);
+        }
         app
+    }
+
+    /// Whether the startup list query is still to run.
+    ///
+    /// The event loop asks this after every draw, which is what puts the cached
+    /// frame on screen before the request goes out.
+    pub fn has_pending_query(&self) -> bool {
+        self.pending_list_query
+    }
+
+    /// Runs the startup list query — SPEC §5 step 6's "then run the list query
+    /// and re-render".
+    ///
+    /// Cache-first does not mean network-never: without this a warm pane would
+    /// show yesterday's rows with no way to move past them.
+    pub fn run_pending_query(&mut self) {
+        if !self.pending_list_query {
+            return;
+        }
+        self.pending_list_query = false;
+        self.refresh_list();
+    }
+
+    /// Puts the cached rows on screen, before anything has been asked of the
+    /// network. Silent when there is no cache or nothing cached for this repo.
+    fn load_cached_list(&mut self) {
+        let (Some(cache), Some(identity)) = (self.cache.as_ref(), self.identity.as_ref()) else {
+            return;
+        };
+        cache.mark_opened(&identity.slug);
+        self.issue_list = cache.issue_list(&identity.slug, self.states);
     }
 
     /// The keys the list view binds: `j`/`k`, the arrows, `g`/`G`, `enter`, `/`,
@@ -284,16 +350,42 @@ impl App {
         let (Some(client), Some(identity)) = (self.client.as_ref(), self.identity.as_ref()) else {
             return;
         };
-        match client.issue_detail(&identity.slug, number, self.detail_comment_page_size) {
+        // Read before the request goes out, and shown when the request does not
+        // come back: a failed fetch never clears what the cache holds. Drawing
+        // it *first*, a frame ahead of the request, waits on the staleness rules
+        // that decide whether a cached detail needs a request at all — until
+        // then every open re-fetches, so an intermediate frame would only
+        // flicker.
+        let cached = self
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.issue_detail(&identity.slug, number));
+        let fetched = client.issue_detail(&identity.slug, number, self.detail_comment_page_size);
+
+        match fetched {
             Ok(detail) => {
-                self.detail = Some(detail);
-                self.detail_scroll.set(0);
-                self.selected = index;
-                self.view = View::Detail;
+                if let (Some(cache), Some(identity)) = (self.cache.as_ref(), self.identity.as_ref())
+                {
+                    cache.save_issue_detail(&identity.slug, &detail);
+                }
+                self.show_detail(detail, index);
                 self.status = None;
             }
-            Err(error) => self.status = Some(StatusLine::Api(error)),
+            Err(error) => {
+                if let Some(detail) = cached {
+                    self.show_detail(detail, index);
+                }
+                self.status = Some(StatusLine::Api(error));
+            }
         }
+    }
+
+    /// Puts one issue on screen, wherever it came from.
+    fn show_detail(&mut self, detail: IssueDetail, index: usize) {
+        self.detail = Some(detail);
+        self.detail_scroll.set(0);
+        self.selected = index;
+        self.view = View::Detail;
     }
 
     /// The rows the filter lets through, in list order — and the rows `enter`,
@@ -354,6 +446,11 @@ impl App {
         let result = client.issue_list(&identity.slug, self.states, self.list_page_size);
         let fetched = match result {
             Ok(list) => {
+                // Written through as it arrives, so the next pane on this repo
+                // opens on these rows without asking for them.
+                if let Some(cache) = self.cache.as_ref() {
+                    cache.save_issue_list(&identity.slug, &list);
+                }
                 self.status = list
                     .rows
                     .is_empty()

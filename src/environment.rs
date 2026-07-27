@@ -34,6 +34,12 @@ pub struct Environment {
     /// The workspace the pane lives in, fixed for the process lifetime. It is
     /// what `worktree.list` is asked about.
     pub workspace_id: Option<String>,
+    /// `HERDR_PLUGIN_STATE_DIR`, which holds the one cache database every pane
+    /// shares, or `None` when the viewer was not launched by herdr.
+    ///
+    /// With no state dir there is nowhere a cache may be written — the viewer
+    /// invents no directory of its own — so the pane simply fetches every time.
+    pub state_dir: Option<PathBuf>,
     /// The GraphQL endpoint to POST to.
     pub graphql_url: String,
     /// The GitHub token, or `None` for the no-token status line.
@@ -65,6 +71,7 @@ impl Default for Environment {
             workspace_cwd: PathBuf::new(),
             herdr_socket: None,
             workspace_id: None,
+            state_dir: None,
             graphql_url: DEFAULT_GRAPHQL_URL.to_string(),
             token: None,
             slug_overrides: config.slug_overrides,
@@ -90,6 +97,9 @@ impl Environment {
     /// `HERDR_PLUGIN_CONFIG_DIR`, which is where `config.toml` lives.
     pub const CONFIG_DIR_VAR: &'static str = "HERDR_PLUGIN_CONFIG_DIR";
 
+    /// `HERDR_PLUGIN_STATE_DIR`, which is where the cache database lives.
+    pub const STATE_DIR_VAR: &'static str = "HERDR_PLUGIN_STATE_DIR";
+
     pub fn from_process() -> Self {
         let context = plugin_context();
         let config_dir = non_empty_var(Self::CONFIG_DIR_VAR).map(PathBuf::from);
@@ -98,6 +108,7 @@ impl Environment {
             herdr_socket: non_empty_var("HERDR_SOCKET_PATH").map(PathBuf::from),
             workspace_id: non_empty_var("HERDR_WORKSPACE_ID")
                 .or_else(|| string_field(context.as_ref(), "workspace_id")),
+            state_dir: non_empty_var(Self::STATE_DIR_VAR).map(PathBuf::from),
             graphql_url: env::var(Self::GRAPHQL_URL_VAR)
                 .ok()
                 .filter(|url| !url.is_empty())
