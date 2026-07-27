@@ -1,15 +1,20 @@
-//! Repo identity: the resolution of a workspace directory to a repo root, and
-//! of that repo root to a slug (ADR-0004).
+//! Repo identity: the resolution of a workspace to a repo root, and of that repo
+//! root to a slug (ADR-0004).
 //!
-//! In this slice the repo root comes from `git` alone — `rev-parse
-//! --show-toplevel` plus `--git-common-dir`, so a linked worktree collapses to
-//! the repo it was made from. The herdr socket, and the `[repo."<path>"]`
-//! config override that sits ahead of `origin` in the ADR's order, are later
-//! tickets.
+//! The repo root comes from herdr when there is a socket — one `worktree.list`
+//! call, which also collapses every linked worktree onto its source repo — and
+//! from `git` when there is not: `rev-parse --show-toplevel` plus
+//! `--git-common-dir`, which is git's own way to the same place.
+//!
+//! The repo root then becomes a slug in the ADR's order: the config override,
+//! `origin`, the sole remote, else an error naming the candidates.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use crate::environment::Environment;
+use crate::herdr::{self, HerdrError};
 
 /// A GitHub `owner/repo` parsed from a remote.
 ///
@@ -21,9 +26,66 @@ pub struct Slug {
     pub name: String,
 }
 
+impl Slug {
+    /// Parses an `owner/repo` as a user writes it in the config override.
+    ///
+    /// Anything else — a URL, a bare name, an extra segment — is `None`, so a
+    /// mistyped override falls through to the remotes rather than querying
+    /// nonsense.
+    pub fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        let (owner, name) = text.split_once('/')?;
+        if owner.is_empty() || name.is_empty() || name.contains('/') {
+            return None;
+        }
+        Some(Self {
+            owner: owner.to_string(),
+            name: name.to_string(),
+        })
+    }
+}
+
 impl fmt::Display for Slug {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.owner, self.name)
+    }
+}
+
+/// The `[repo."<repo_root>"] slug = "owner/repo"` table, keyed by repo root
+/// exactly (ADR-0004).
+///
+/// It is the first step of the resolution order, and the only way to give a
+/// checkout with no remote an identity at all. Linked worktrees have already
+/// collapsed onto their source repo by the time a key is looked up, so one entry
+/// covers every worktree of a repo.
+///
+/// Nothing populates it yet — the config file is a later ticket, and
+/// [`Environment::from_process`] always builds it empty. This type is the shape
+/// that ticket has to produce: pairs of repo root and slug, both already parsed.
+#[derive(Debug, Clone, Default)]
+pub struct SlugOverrides {
+    entries: Vec<(PathBuf, Slug)>,
+}
+
+impl SlugOverrides {
+    /// No overrides at all — what a viewer with no config file resolves with.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    pub fn from_entries(entries: impl IntoIterator<Item = (PathBuf, Slug)>) -> Self {
+        Self {
+            entries: entries.into_iter().collect(),
+        }
+    }
+
+    /// The override for a repo root, matched exactly. Moving a checkout
+    /// invalidates its entry, visibly rather than silently.
+    pub fn slug_for(&self, repo_root: &Path) -> Option<&Slug> {
+        self.entries
+            .iter()
+            .find(|(path, _)| path == repo_root)
+            .map(|(_, slug)| slug)
     }
 }
 
@@ -70,18 +132,45 @@ impl fmt::Display for IdentityError {
     }
 }
 
-/// Resolves the workspace directory to a repo root and a slug.
-pub fn resolve(workspace_cwd: &Path) -> Result<RepoIdentity, IdentityError> {
-    let repo_root = repo_root(workspace_cwd)?;
-    let slug = slug_of(&repo_root)?;
+/// Resolves the workspace to a repo root and a slug. Once, at startup: one repo
+/// per pane, never re-resolved.
+pub fn resolve(environment: &Environment) -> Result<RepoIdentity, IdentityError> {
+    let repo_root = repo_root(environment)?;
+    let slug = match environment.slug_overrides.slug_for(&repo_root) {
+        Some(slug) => slug.clone(),
+        None => slug_of(&repo_root)?,
+    };
     Ok(RepoIdentity { repo_root, slug })
 }
 
-/// The repo root behind a workspace directory.
+/// The repo root behind a workspace: herdr's answer when there is a socket,
+/// git's when there is not.
 ///
-/// `--show-toplevel` alone stops at a linked worktree, so the common dir — which
-/// every worktree shares with its source repo — is what collapses them.
-pub fn repo_root(workspace_cwd: &Path) -> Result<PathBuf, IdentityError> {
+/// `not_git_worktree` is herdr's canonical "no repo here" and is taken as final.
+/// Any other trouble reaching the socket falls through to `git` — a viewer run
+/// outside herdr, or against a stale socket, still resolves.
+pub fn repo_root(environment: &Environment) -> Result<PathBuf, IdentityError> {
+    let workspace_cwd = environment.workspace_cwd.as_path();
+    if let Some(socket) = &environment.herdr_socket {
+        match herdr::worktree_source(socket, environment.workspace_id.as_deref(), workspace_cwd) {
+            Ok(source) => return Ok(source.repo_root),
+            Err(HerdrError::NotGitWorktree) => {
+                return Err(IdentityError::NoRepo {
+                    workspace_cwd: workspace_cwd.to_path_buf(),
+                });
+            }
+            Err(HerdrError::Unavailable { .. }) => {}
+        }
+    }
+    repo_root_from_git(workspace_cwd)
+}
+
+/// The repo root `git` alone can reach.
+///
+/// `--show-toplevel` stops at a linked worktree, so the common dir — which every
+/// worktree shares with its source repo — is what collapses them. Herdr does
+/// this for us; git has to be asked.
+fn repo_root_from_git(workspace_cwd: &Path) -> Result<PathBuf, IdentityError> {
     let output = git(
         workspace_cwd,
         &["rev-parse", "--show-toplevel", "--git-common-dir"],
@@ -209,6 +298,38 @@ mod tests {
             "ssh://git@github.com/nyanyaon/github-issue-herdr-plugin.git",
         ] {
             assert_eq!(parse_remote_url(url), Ok(expected.clone()), "{url}");
+        }
+    }
+
+    #[test]
+    fn reads_an_override_only_for_the_exact_repo_root() {
+        let overrides = SlugOverrides::from_entries([(
+            PathBuf::from("/home/me/work/fork"),
+            Slug::parse("upstream-org/project").expect("a slug this test wrote"),
+        )]);
+        assert_eq!(
+            overrides
+                .slug_for(Path::new("/home/me/work/fork"))
+                .map(Slug::to_string),
+            Some("upstream-org/project".to_string())
+        );
+        assert!(
+            overrides
+                .slug_for(Path::new("/home/me/work/fork/sub"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn refuses_an_override_that_is_not_owner_slash_repo() {
+        for text in [
+            "https://github.com/nyanyaon/thing",
+            "nyanyaon",
+            "nyanyaon/",
+            "/thing",
+            "nyanyaon/thing/extra",
+        ] {
+            assert_eq!(Slug::parse(text), None, "{text}");
         }
     }
 
