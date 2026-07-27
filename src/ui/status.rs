@@ -9,7 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 
-use crate::github::ApiError;
+use crate::github::{ApiError, IssueStates};
 use crate::identity::IdentityError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,8 +18,8 @@ pub enum StatusLine {
     Identity(IdentityError),
     /// The API refused, or could not be reached.
     Api(ApiError),
-    /// The query succeeded and the repo has no open issues.
-    NoOpenIssues,
+    /// The query succeeded and returned nothing for the state it asked for.
+    Empty(IssueStates),
 }
 
 impl fmt::Display for StatusLine {
@@ -27,7 +27,15 @@ impl fmt::Display for StatusLine {
         match self {
             Self::Identity(error) => error.fmt(f),
             Self::Api(error) => error.fmt(f),
-            Self::NoOpenIssues => write!(f, "no open issues"),
+            // Each empty state names the state `o` would move to next, so the
+            // way out of an empty list is on screen.
+            Self::Empty(IssueStates::Open) => {
+                write!(f, "no open issues · [o] to include closed")
+            }
+            Self::Empty(IssueStates::Closed) => {
+                write!(f, "no closed issues · [o] to include all")
+            }
+            Self::Empty(IssueStates::All) => write!(f, "no issues"),
         }
     }
 }

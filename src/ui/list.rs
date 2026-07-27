@@ -19,9 +19,9 @@ const LABEL_WIDTH: usize = 12;
 const COUNT_WIDTH: usize = 3;
 const AGE_WIDTH: usize = 4;
 
-/// The keys this slice binds, and nothing else. `/`, `o` and `r` are later
-/// tickets, so they are not advertised.
-const KEY_HINTS: &str = " j/k move   enter open   g/G top/bottom   q close";
+/// The keys the list binds, and nothing else. `r` is a later ticket, so it is
+/// not advertised. Seventy columns, so it still fits the 72-column pane.
+const KEY_HINTS: &str = " j/k move   enter open   g/G top/bottom   / filter   o state   q close";
 
 pub fn render(frame: &mut Frame, app: &App) {
     let [header, top_rule, rows, bottom_rule, footer] = Layout::vertical([
@@ -35,11 +35,17 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let now = age::now();
     if let Some(list) = app.issue_list() {
-        render_header(frame, header, list, now);
-        render_rows(frame, rows, list, app.selected(), now);
+        render_header(frame, header, app, list, now);
+        render_rows(frame, rows, app, now);
     }
     render_rule(frame, top_rule);
     render_rule(frame, bottom_rule);
+    // While typing, the footer is the filter prompt: a user has to see what they
+    // are typing, and a status line has nowhere else to go.
+    if app.is_filtering() {
+        render_filter_prompt(frame, footer, app.filter());
+        return;
+    }
     match app.status() {
         Some(line) => status::render(frame, footer, line),
         None => frame.render_widget(
@@ -49,15 +55,23 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
 }
 
-/// `nyanyaon/github-issue-herdr-plugin · 6 open · fetched 3m ago`.
+/// `nyanyaon/github-issue-herdr-plugin · 6 open · fetched 3m ago`, or
+/// `nyanyaon/github-issue-herdr-plugin · 3 of 6 shown · fetched 3m ago` while a
+/// filter is active.
 ///
 /// The name is always the `nameWithOwner` the API answered with, never the slug
 /// parsed from the remote, which is what makes a rename a non-event.
-fn render_header(frame: &mut Frame, area: Rect, list: &IssueList, now: i64) {
+fn render_header(frame: &mut Frame, area: Rect, app: &App, list: &IssueList, now: i64) {
+    // The filter counts against the rows on hand, since that is all it can ever
+    // match; unfiltered, the count is what the query said the repo holds.
+    let counts = if app.filter().is_empty() {
+        format!("{} {}", list.total_count, app.states().noun())
+    } else {
+        format!("{} of {} shown", app.visible_rows().len(), list.rows.len())
+    };
     let text = format!(
-        " {} · {} open · {}",
+        " {} · {counts} · {}",
         list.name_with_owner,
-        list.total_count,
         age::fetched_phrase(list.fetched_at, now)
     );
     let line = Line::from(truncate(&text, area.width as usize))
@@ -73,17 +87,26 @@ fn render_rule(frame: &mut Frame, area: Rect) {
     );
 }
 
-fn render_rows(frame: &mut Frame, area: Rect, list: &IssueList, selected: usize, now: i64) {
+/// ` /walk` — what has been typed so far, in place of the key hints.
+fn render_filter_prompt(frame: &mut Frame, area: Rect, filter: &str) {
+    let line = Line::from(truncate(&format!(" /{filter}"), area.width as usize))
+        .style(Style::default().fg(Color::Cyan));
+    frame.render_widget(line, area);
+}
+
+/// Draws the rows the filter lets through, which unfiltered is all of them.
+fn render_rows(frame: &mut Frame, area: Rect, app: &App, now: i64) {
     let height = area.height as usize;
     if height == 0 {
         return;
     }
+    let selected = app.selected();
     // Scrolling is a pure function of the selection and the pane height, so no
     // state survives a resize.
     let offset = selected.saturating_sub(height.saturating_sub(1));
-    let lines: Vec<Line> = list
-        .rows
-        .iter()
+    let lines: Vec<Line> = app
+        .visible_rows()
+        .into_iter()
         .enumerate()
         .skip(offset)
         .take(height)

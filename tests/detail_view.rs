@@ -487,3 +487,94 @@ fn herdr_reserved_keys_are_never_consumed_in_the_detail_view() {
     press(&mut app, KeyCode::Char('q'));
     assert!(app.should_exit());
 }
+
+/// The filter and the detail view were built on separate branches, and the
+/// merge had one hazard: the selection counts *visible* rows, so `enter` under
+/// a filter must open the row under the cursor rather than the nth fetched one.
+///
+/// Here `#42` is the second row fetched but the first — and only — row the
+/// filter leaves, so an index into the wrong list opens `#7` or nothing at all.
+#[test]
+fn enter_under_a_filter_opens_the_row_the_cursor_is_on() {
+    let repo = FixtureRepo::with_origin(REMOTE);
+    let stub = stub(
+        issue_list(vec![
+            row(7, "Pane UI shape"),
+            row(42, "Walking skeleton"),
+            row(11, "Token discovery"),
+        ]),
+        vec![
+            (7, detail(7, "Pane UI shape", "The wrong issue.", vec![])),
+            (
+                42,
+                detail(42, "Walking skeleton", "The right issue.", vec![]),
+            ),
+        ],
+    );
+    let mut app = App::start(&environment(&repo.path, &stub));
+
+    press(&mut app, KeyCode::Char('/'));
+    for character in "wskel".chars() {
+        press(&mut app, KeyCode::Char(character));
+    }
+    // The filter left one row, and the selection sits on it at index 0.
+    let filtered = screen(&app, 72, 12);
+    assert!(filtered.contains("1 of 3 shown"), "{filtered}");
+
+    press(&mut app, KeyCode::Enter); // leaves typing mode, keeps the filter
+    press(&mut app, KeyCode::Enter); // opens the row under the cursor
+
+    let detail_screen = screen(&app, 72, 12);
+    assert!(detail_screen.contains("‹ #42"), "{detail_screen}");
+    assert!(
+        detail_screen.contains("The right issue."),
+        "{detail_screen}"
+    );
+    assert!(
+        !detail_screen.contains("The wrong issue."),
+        "{detail_screen}"
+    );
+}
+
+/// `n` from inside the detail view walks the *filtered* order too, so it never
+/// steps onto a row the filter is hiding.
+#[test]
+fn n_walks_the_filtered_order_rather_than_the_fetched_one() {
+    let repo = FixtureRepo::with_origin(REMOTE);
+    let stub = stub(
+        issue_list(vec![
+            row(7, "Skeleton crew"),
+            row(42, "Pane UI shape"),
+            row(11, "Skeleton key"),
+        ]),
+        vec![
+            (7, detail(7, "Skeleton crew", "First.", vec![])),
+            (
+                42,
+                detail(42, "Pane UI shape", "Hidden by the filter.", vec![]),
+            ),
+            (11, detail(11, "Skeleton key", "Second.", vec![])),
+        ],
+    );
+    let mut app = App::start(&environment(&repo.path, &stub));
+
+    press(&mut app, KeyCode::Char('/'));
+    for character in "skel".chars() {
+        press(&mut app, KeyCode::Char(character));
+    }
+    assert!(screen(&app, 72, 12).contains("2 of 3 shown"));
+
+    press(&mut app, KeyCode::Enter); // leave typing mode
+    press(&mut app, KeyCode::Enter); // open #7
+    assert!(screen(&app, 72, 12).contains("‹ #7"));
+
+    // #42 sits between them in the fetched list, and the filter hides it.
+    press(&mut app, KeyCode::Char('n'));
+    let stepped = screen(&app, 72, 12);
+    assert!(stepped.contains("‹ #11"), "{stepped}");
+    assert!(!stepped.contains("Hidden by the filter."), "{stepped}");
+
+    // And #11 is the last visible row, so `n` stops rather than wrapping.
+    press(&mut app, KeyCode::Char('n'));
+    assert!(screen(&app, 72, 12).contains("‹ #11"));
+}

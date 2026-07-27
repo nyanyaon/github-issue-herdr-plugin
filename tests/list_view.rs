@@ -109,10 +109,16 @@ fn cold_start_renders_a_row_for_each_issue() {
     );
 
     // The keys this slice binds, and only those.
-    assert!(
-        screen.contains("j/k move   enter open   g/G top/bottom   q close"),
-        "{screen}"
-    );
+    for hint in [
+        "j/k move",
+        "enter open",
+        "g/G top/bottom",
+        "/ filter",
+        "o state",
+        "q close",
+    ] {
+        assert!(screen.contains(hint), "{hint:?} missing from:\n{screen}");
+    }
 }
 
 #[test]
@@ -204,7 +210,8 @@ fn herdr_reserved_keys_are_never_consumed() {
     assert!(!app.should_exit());
 
     // Unbound plain keys do nothing either.
-    for code in [KeyCode::Char('r'), KeyCode::Char('o'), KeyCode::Tab] {
+    // `o` and `enter` are bound now, so neither belongs in this list.
+    for code in [KeyCode::Char('r'), KeyCode::Tab] {
         press(&mut app, code);
     }
     assert!(selected_line(&screen(&app, 72, 10)).contains("#7"));
@@ -255,7 +262,10 @@ fn a_repo_with_no_open_issues_says_so() {
         screen.contains("nyanyaon/github-issue-herdr-plugin · 0 open"),
         "{screen}"
     );
-    assert!(screen.contains("no open issues"), "{screen}");
+    assert!(
+        screen.contains("no open issues · [o] to include closed"),
+        "{screen}"
+    );
 }
 
 #[test]
