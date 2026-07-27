@@ -13,15 +13,20 @@ use crate::app::App;
 use crate::github::{IssueList, IssueRow};
 use crate::ui::{fit, right, status, truncate};
 
-const MARKER_WIDTH: usize = 2;
+/// The `▸ ` that marks the selected row, or the space that stands in for it.
+const CURSOR_WIDTH: usize = 2;
 const NUMBER_WIDTH: usize = 5;
+/// The `● ` that marks a row whose cached detail is behind the list, or the
+/// space that stands in for it. Always drawn, so the titles line up either way.
+const MARKER_WIDTH: usize = 2;
 const LABEL_WIDTH: usize = 12;
 const COUNT_WIDTH: usize = 3;
 const AGE_WIDTH: usize = 4;
 
-/// The keys the list binds, and nothing else. `r` is a later ticket, so it is
-/// not advertised. Seventy columns, so it still fits the 72-column pane.
-const KEY_HINTS: &str = " j/k move   enter open   g/G top/bottom   / filter   o state   q close";
+/// The line ADR-0002 draws under the list, verbatim. Sixty-five columns, so it
+/// fits the 72-column pane with room to spare; `g`/`G` are bound but not
+/// advertised, because the line the ADR settled on does not carry them.
+const KEY_HINTS: &str = " j/k move   enter open   / filter   o state   r refresh   q close";
 
 pub fn render(frame: &mut Frame, app: &App) {
     let [header, top_rule, rows, bottom_rule, footer] = Layout::vertical([
@@ -100,6 +105,7 @@ fn render_rows(frame: &mut Frame, area: Rect, app: &App, now: i64) {
     if height == 0 {
         return;
     }
+    let width = area.width as usize;
     let selected = app.selected();
     // Scrolling is a pure function of the selection and the pane height, so no
     // state survives a resize.
@@ -110,23 +116,27 @@ fn render_rows(frame: &mut Frame, area: Rect, app: &App, now: i64) {
         .enumerate()
         .skip(offset)
         .take(height)
-        .map(|(index, row)| row_line(row, index == selected, area.width as usize, now))
+        .map(|(index, row)| row_line(row, index == selected, app.is_stale(row), width, now))
         .collect();
     frame.render_widget(ratatui::text::Text::from(lines), area);
 }
 
-/// Number, title, first label, comment count when non-zero, relative age.
-fn row_line<'a>(row: &IssueRow, selected: bool, width: usize, now: i64) -> Line<'a> {
+/// Number, the staleness marker, title, first label, comment count when
+/// non-zero, relative age.
+fn row_line<'a>(row: &IssueRow, selected: bool, stale: bool, width: usize, now: i64) -> Line<'a> {
     let dim = Style::default().fg(Color::DarkGray);
     let mut spans = vec![
         Span::raw(if selected { "▸ " } else { "  " }),
         Span::styled(fit(&format!("#{}", row.number), NUMBER_WIDTH), dim),
-        Span::raw(" "),
+        // `●` when this issue has moved on since its detail was last read. It
+        // is drawn undimmed, because seeing it at a glance is the whole point.
+        Span::raw(if stale { "● " } else { "  " }),
     ];
 
     let trailing = COUNT_WIDTH + 3 + AGE_WIDTH;
-    let with_label = MARKER_WIDTH + NUMBER_WIDTH + 1 + 1 + LABEL_WIDTH + trailing;
-    let without_label = MARKER_WIDTH + NUMBER_WIDTH + 1 + trailing;
+    let chrome = CURSOR_WIDTH + NUMBER_WIDTH + MARKER_WIDTH;
+    let with_label = chrome + 1 + LABEL_WIDTH + trailing;
+    let without_label = chrome + trailing;
 
     let count = if row.comment_count == 0 {
         String::new()
@@ -148,9 +158,12 @@ fn row_line<'a>(row: &IssueRow, selected: bool, width: usize, now: i64) -> Line<
     } else if width >= without_label + 8 {
         spans.push(title_span(&row.title, width - without_label, selected));
     } else {
-        // Too narrow for anything but the number and the title.
-        let room = width.saturating_sub(MARKER_WIDTH + NUMBER_WIDTH + 1);
-        spans.push(title_span(&row.title, room, selected));
+        // Too narrow for anything but the number, the marker and the title.
+        spans.push(title_span(
+            &row.title,
+            width.saturating_sub(chrome),
+            selected,
+        ));
         return Line::from(spans);
     }
 

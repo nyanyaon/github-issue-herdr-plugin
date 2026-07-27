@@ -15,9 +15,9 @@ use crate::app::App;
 use crate::github::{IssueComment, IssueDetail};
 use crate::ui::{markdown, status, truncate};
 
-/// The keys this view binds. `m` (load more comments) and `r` (re-fetch this
-/// issue) are later tickets, so they are not advertised.
-const KEY_HINTS: &str = " esc back   j/k scroll   n/p next issue   q close";
+/// The line ADR-0002 draws under the detail view, verbatim. `m` (load more
+/// comments) is a later ticket, so it is not advertised.
+const KEY_HINTS: &str = " esc back   j/k scroll   n/p next issue   r refresh   q close";
 
 /// A one-column left margin, so prose never starts against the pane edge.
 const MARGIN: u16 = 1;
