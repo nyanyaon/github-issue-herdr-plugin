@@ -276,7 +276,7 @@ fn a_transport_failure_states_the_age_of_the_cache_it_left_on_screen() {
     read_four_hours_ago(&state);
     let stub = StubGithub::serving(issue_list());
 
-    let app = start(&Environment {
+    let mut app = start(&Environment {
         graphql_url: UNREACHABLE.to_string(),
         ..pane(&repo.path, &stub, &state)
     });
@@ -288,6 +288,14 @@ fn a_transport_failure_states_the_age_of_the_cache_it_left_on_screen() {
     );
     assert_cached_rows_survived(&screen, &state);
     assert_eq!(stub.request_count(), 0, "nothing reached a server at all");
+
+    // Nor does a dead network turn into background work: the pane owes nothing
+    // and asks for nothing until a key says so.
+    for _ in 0..3 {
+        assert!(!app.has_pending_query());
+        app.run_pending_query();
+    }
+    assert_eq!(stub.request_count(), 0);
 }
 
 #[test]
