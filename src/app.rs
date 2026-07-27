@@ -5,11 +5,13 @@
 //! drives it with a real PTY. Nothing below the seam is substitutable except the
 //! GraphQL endpoint.
 
+use std::cell::Cell;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 
 use crate::environment::Environment;
-use crate::github::{ApiError, GithubClient, IssueList, IssueRow, IssueStates};
+use crate::github::{ApiError, GithubClient, IssueDetail, IssueList, IssueRow, IssueStates};
 use crate::identity::RepoIdentity;
 use crate::ui;
 use crate::ui::status::StatusLine;
@@ -18,12 +20,27 @@ use crate::ui::status::StatusLine;
 /// tunable is a later ticket.
 const LIST_PAGE_SIZE: u32 = 50;
 
+/// How many comments one detail query asks for — GraphQL's maximum, and the
+/// whole thread for all but the longest issues. Paging past it is a later
+/// ticket.
+const DETAIL_COMMENT_PAGE_SIZE: u32 = 100;
+
+/// The two screens. There is no third.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    List,
+    Detail,
+}
+
 /// What the keyboard means right now.
 ///
 /// `/` switches to [`Mode::Filtering`], where ordinary letters are filter text
 /// rather than commands, and `esc` or `enter` leaves it again. The mode is
 /// explicit state precisely so that the list's plain-key commands and the
 /// filter's letters never have to guess which of them a keystroke was meant for.
+///
+/// Orthogonal to [`View`]: the mode only decides what a key means *in the list*,
+/// and the detail view reads its own keys before the mode is ever consulted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Plain keys are commands.
@@ -34,18 +51,24 @@ pub enum Mode {
 
 pub struct App {
     identity: Option<RepoIdentity>,
-    /// Held for the pane's lifetime so that `o` can re-query without resolving
-    /// the identity or the token again.
+    /// Held for the pane's lifetime so that `o` can re-query, and `enter`, `n`
+    /// and `p` can fetch a detail, without resolving the identity or the token
+    /// again. It holds no connection and does no work between calls.
     client: Option<GithubClient>,
     states: IssueStates,
     issue_list: Option<IssueList>,
+    detail: Option<IssueDetail>,
     /// The filter text. Applied to the cached rows at render time; changing it
     /// never touches the network.
     filter: String,
     mode: Mode,
     status: Option<StatusLine>,
+    view: View,
     /// An index into the *visible* rows, not into the fetched list.
     selected: usize,
+    /// The detail view's first visible line. A [`Cell`] because the draw is the
+    /// only place the content's height is known, and it clamps this there.
+    detail_scroll: Cell<usize>,
     exit: bool,
 }
 
@@ -61,10 +84,13 @@ impl App {
             client: None,
             states: IssueStates::default(),
             issue_list: None,
+            detail: None,
             filter: String::new(),
             mode: Mode::Normal,
             status: None,
+            view: View::List,
             selected: 0,
+            detail_scroll: Cell::new(0),
             exit: false,
         };
 
@@ -87,8 +113,9 @@ impl App {
         app
     }
 
-    /// The keys this slice binds: `j`/`k`, the arrows, `g`/`G`, `/`, `esc`, `o`,
-    /// `q`.
+    /// The keys the list view binds: `j`/`k`, the arrows, `g`/`G`, `enter`, `/`,
+    /// `esc`, `o`, `q`. The detail view's own keys are in
+    /// [`App::handle_detail_key`].
     ///
     /// Anything carrying Control or Alt is ignored outright, so `ctrl+b` and
     /// `ctrl+v` — herdr's prefix and its image paste — are never consumed.
@@ -105,6 +132,12 @@ impl App {
         {
             return;
         }
+        // The detail view reads first: it is a whole screen, and the filter's
+        // typing mode only ever governs the list underneath it.
+        if self.view == View::Detail {
+            self.handle_detail_key(key);
+            return;
+        }
         if self.mode == Mode::Filtering {
             self.handle_filter_key(key);
             return;
@@ -114,6 +147,7 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.select_previous(),
             KeyCode::Char('g') => self.selected = 0,
             KeyCode::Char('G') => self.selected = self.last_row(),
+            KeyCode::Enter => self.open(self.selected),
             KeyCode::Char('/') => self.mode = Mode::Filtering,
             KeyCode::Esc => self.clear_filter(),
             KeyCode::Char('o') => self.cycle_states(),
@@ -147,7 +181,10 @@ impl App {
     }
 
     pub fn render(&self, frame: &mut Frame) {
-        ui::list::render(frame, self);
+        match self.view {
+            View::List => ui::list::render(frame, self),
+            View::Detail => ui::detail::render(frame, self),
+        }
     }
 
     /// Whether `q` has been pressed and the pane should close.
@@ -168,7 +205,88 @@ impl App {
         self.selected
     }
 
-    /// The rows the filter lets through, in list order.
+    /// The issue on screen in the detail view, if that is the view on screen.
+    pub fn detail(&self) -> Option<&IssueDetail> {
+        self.detail.as_ref()
+    }
+
+    /// The detail view's first visible line.
+    pub fn detail_scroll(&self) -> usize {
+        self.detail_scroll.get()
+    }
+
+    /// Holds the scroll inside content of this height, at the draw that is the
+    /// first to know it. A resize therefore re-wraps and re-clamps together.
+    pub fn clamp_detail_scroll(&self, max: usize) {
+        self.detail_scroll.set(self.detail_scroll.get().min(max));
+    }
+
+    /// `esc` back, `j`/`k` scroll, `n`/`p` next and previous issue, `q` close.
+    ///
+    /// `n` and `p` follow the list's order and stay in the detail view, so a
+    /// run of issues reads without a trip back to the list.
+    fn handle_detail_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.view = View::List;
+                self.detail = None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.detail_scroll.set(self.detail_scroll.get() + 1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.detail_scroll
+                    .set(self.detail_scroll.get().saturating_sub(1));
+            }
+            KeyCode::Char('n') => self.step(1),
+            KeyCode::Char('p') => self.step(-1),
+            KeyCode::Char('q') => self.exit = true,
+            _ => {}
+        }
+    }
+
+    /// Opens the issue one step along the list from the one on screen.
+    ///
+    /// The selection only moves if the fetch succeeded, so a failure leaves the
+    /// issue being read exactly where it was.
+    fn step(&mut self, delta: isize) {
+        let Some(target) = self.selected.checked_add_signed(delta) else {
+            return;
+        };
+        if target >= self.visible_rows().len() {
+            return;
+        }
+        self.open(target);
+    }
+
+    /// Fetches one issue's detail and shows it — the only thing besides startup
+    /// that touches the network, and only ever because a key asked it to.
+    ///
+    /// On failure the status line says why and the view does not change: a
+    /// failed fetch never clears what is already on screen.
+    /// `index` counts the *visible* rows, so `enter` under a filter opens the
+    /// issue that is actually under the cursor rather than the nth fetched one.
+    fn open(&mut self, index: usize) {
+        let Some(number) = self.visible_rows().get(index).map(|row| row.number) else {
+            return;
+        };
+        let (Some(client), Some(identity)) = (self.client.as_ref(), self.identity.as_ref()) else {
+            return;
+        };
+        match client.issue_detail(&identity.slug, number, DETAIL_COMMENT_PAGE_SIZE) {
+            Ok(detail) => {
+                self.detail = Some(detail);
+                self.detail_scroll.set(0);
+                self.selected = index;
+                self.view = View::Detail;
+                self.status = None;
+            }
+            Err(error) => self.status = Some(StatusLine::Api(error)),
+        }
+    }
+
+    /// The rows the filter lets through, in list order — and the rows `enter`,
+    /// `n` and `p` move through.
     ///
     /// Cheap enough to recompute per render — fifty rows and a subsequence test —
     /// so there is no second copy of the list to keep in step with the first.

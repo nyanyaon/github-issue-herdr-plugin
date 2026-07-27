@@ -19,9 +19,9 @@ const LABEL_WIDTH: usize = 12;
 const COUNT_WIDTH: usize = 3;
 const AGE_WIDTH: usize = 4;
 
-/// The keys this slice binds, and nothing else. `enter` and `r` are later
-/// tickets, so they are not advertised.
-const KEY_HINTS: &str = " j/k move   g/G top/bottom   / filter   o state   q close";
+/// The keys the list binds, and nothing else. `r` is a later ticket, so it is
+/// not advertised. Seventy columns, so it still fits the 72-column pane.
+const KEY_HINTS: &str = " j/k move   enter open   g/G top/bottom   / filter   o state   q close";
 
 pub fn render(frame: &mut Frame, app: &App) {
     let [header, top_rule, rows, bottom_rule, footer] = Layout::vertical([

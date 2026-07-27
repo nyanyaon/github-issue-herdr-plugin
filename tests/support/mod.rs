@@ -41,21 +41,58 @@ pub struct StubGithub {
 impl StubGithub {
     /// Answers every request with `200` and the given GraphQL body.
     pub fn serving(body: impl Into<String>) -> Self {
-        Self::answering(200, body.into(), false)
+        let body = body.into();
+        Self::answering(200, move |_request| body.clone(), false)
     }
 
     /// Answers every request with the given status and body.
     pub fn responding(status: u16, body: impl Into<String>) -> Self {
-        Self::answering(status, body.into(), false)
+        let body = body.into();
+        Self::answering(status, move |_request| body.clone(), false)
     }
 
     /// Answers the first request with the given body and every later one with
     /// `503` — how a test makes a refresh fail after a start that succeeded.
     pub fn serving_once(body: impl Into<String>) -> Self {
-        Self::answering(200, body.into(), true)
+        let body = body.into();
+        Self::answering(200, move |_request| body.clone(), true)
     }
 
-    fn answering(status: u16, body: String, only_once: bool) -> Self {
+    /// Answers each request with the body of the first rule whose needle
+    /// appears in the request — which is how one stub serves both the issue
+    /// list query and a detail query per issue.
+    ///
+    /// Whitespace is squeezed out of both sides first, so a needle matches
+    /// whether the client sent its JSON compact or pretty-printed.
+    pub fn routing(rules: Vec<(String, String)>) -> Self {
+        let rules: Vec<(String, String)> = rules
+            .into_iter()
+            .map(|(needle, body)| (squeeze(&needle), body))
+            .collect();
+        Self::answering(
+            200,
+            move |request| {
+                let request = squeeze(request);
+                rules
+                    .iter()
+                    .find(|(needle, _)| request.contains(needle.as_str()))
+                    .map(|(_, body)| body.clone())
+                    .unwrap_or_else(|| {
+                        // A visible failure rather than a mystery: an unrouted
+                        // request surfaces as a github error on the status line.
+                        r#"{"errors":[{"message":"no stub rule matched this request"}]}"#
+                            .to_string()
+                    })
+            },
+            false,
+        )
+    }
+
+    fn answering(
+        status: u16,
+        resolve: impl Fn(&str) -> String + Send + 'static,
+        only_once: bool,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub server");
         let url = format!(
             "http://{}/graphql",
@@ -67,9 +104,9 @@ impl StubGithub {
             for (served, stream) in listener.incoming().enumerate() {
                 let Ok(stream) = stream else { continue };
                 if only_once && served > 0 {
-                    answer(stream, 503, "{}", &recorded);
+                    answer(stream, 503, &|_request| "{}".to_string(), &recorded);
                 } else {
-                    answer(stream, status, &body, &recorded);
+                    answer(stream, status, &resolve, &recorded);
                 }
             }
         });
@@ -87,7 +124,12 @@ impl StubGithub {
     }
 }
 
-fn answer(mut stream: TcpStream, status: u16, body: &str, requests: &Mutex<Vec<String>>) {
+fn answer(
+    mut stream: TcpStream,
+    status: u16,
+    resolve: &dyn Fn(&str) -> String,
+    requests: &Mutex<Vec<String>>,
+) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone stub connection"));
     let mut content_length = 0usize;
     let mut wants_gzip = false;
@@ -106,12 +148,14 @@ fn answer(mut stream: TcpStream, status: u16, body: &str, requests: &Mutex<Vec<S
     }
     let mut request_body = vec![0u8; content_length];
     let _ = reader.read_exact(&mut request_body);
+    let request_body = String::from_utf8_lossy(&request_body).into_owned();
     // Recorded before the answer goes out, so a test that sees the response has
     // already seen the request.
     requests
         .lock()
         .expect("stub request log")
-        .push(String::from_utf8_lossy(&request_body).into_owned());
+        .push(request_body.clone());
+    let body = resolve(&request_body);
 
     let (payload, encoding) = if wants_gzip {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -128,6 +172,12 @@ fn answer(mut stream: TcpStream, status: u16, body: &str, requests: &Mutex<Vec<S
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(&payload);
     let _ = stream.flush();
+}
+
+/// Drops every whitespace character, so `"number": 8` and `"number":8` are the
+/// same request as far as a routing rule is concerned.
+fn squeeze(text: &str) -> String {
+    text.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
 /// A local stand-in for the herdr socket at `HERDR_SOCKET_PATH`.

@@ -52,13 +52,18 @@ pub fn relative_age(then: i64, now: i64) -> String {
     }
 }
 
+/// A prose age for a header or a comment rule: `just now`, `18m ago`, `3d ago`.
+pub fn ago_phrase(then: i64, now: i64) -> String {
+    if now - then < 60 {
+        "just now".to_string()
+    } else {
+        format!("{} ago", relative_age(then, now))
+    }
+}
+
 /// The header's phrasing for the age of the data on screen.
 pub fn fetched_phrase(fetched_at: i64, now: i64) -> String {
-    if now - fetched_at < 60 {
-        "fetched just now".to_string()
-    } else {
-        format!("fetched {} ago", relative_age(fetched_at, now))
-    }
+    format!("fetched {}", ago_phrase(fetched_at, now))
 }
 
 #[cfg(test)]
@@ -78,5 +83,13 @@ mod tests {
         assert_eq!(relative_age(0, 18 * 60), "18m");
         assert_eq!(relative_age(0, 4 * 3_600), "4h");
         assert_eq!(relative_age(0, 12 * 86_400), "12d");
+    }
+
+    #[test]
+    fn prose_ages_read_as_a_phrase() {
+        assert_eq!(ago_phrase(0, 30), "just now");
+        assert_eq!(ago_phrase(0, 18 * 60), "18m ago");
+        assert_eq!(fetched_phrase(0, 30), "fetched just now");
+        assert_eq!(fetched_phrase(0, 4 * 3_600), "fetched 4h ago");
     }
 }
