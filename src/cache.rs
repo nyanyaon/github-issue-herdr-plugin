@@ -574,13 +574,24 @@ fn user_version(connection: &Connection) -> rusqlite::Result<i64> {
 /// Carries a database forward to the last of `migrations`, applying only the
 /// steps it is missing.
 ///
-/// The whole thing is one `IMMEDIATE` transaction, which is what makes two panes
+/// The steps are one `IMMEDIATE` transaction, which is what makes two panes
 /// opening the same fresh file at once safe: the second waits out the first
 /// (that is what the busy timeout is for), then re-reads `user_version` inside
 /// the transaction and finds there is nothing left to do. `user_version` is
 /// stored in the database header and rolls back with everything else, so a step
 /// that fails leaves the file at the version it was already at.
+///
+/// The version is read *before* that transaction as well, and the common case —
+/// a database already at this build's version, which is every launch after the
+/// first — returns without ever asking for the write lock. That matters because
+/// opening the cache is on the path to the first frame: a pane must not wait out
+/// another pane's prune to draw rows it can already see. The check inside the
+/// transaction is still the one that decides, so the cheap read racing another
+/// pane's migration costs at worst a lock taken for nothing.
 fn migrate(connection: &Connection, migrations: &[&str]) -> rusqlite::Result<()> {
+    if user_version(connection)? >= migrations.len() as i64 {
+        return Ok(());
+    }
     let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
     let current = user_version(&transaction)?;
     for (index, statements) in migrations.iter().enumerate() {
