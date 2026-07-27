@@ -17,6 +17,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,33 +33,61 @@ use serde_json::json;
 /// A local stand-in for `api.github.com/graphql`.
 pub struct StubGithub {
     pub url: String,
+    /// Every request body it has been sent, in order — which is how a test
+    /// asserts both what was asked for and that nothing was asked at all.
+    requests: Arc<Mutex<Vec<String>>>,
 }
 
 impl StubGithub {
     /// Answers every request with `200` and the given GraphQL body.
     pub fn serving(body: impl Into<String>) -> Self {
-        Self::responding(200, body)
+        Self::answering(200, body.into(), false)
     }
 
     /// Answers every request with the given status and body.
     pub fn responding(status: u16, body: impl Into<String>) -> Self {
+        Self::answering(status, body.into(), false)
+    }
+
+    /// Answers the first request with the given body and every later one with
+    /// `503` — how a test makes a refresh fail after a start that succeeded.
+    pub fn serving_once(body: impl Into<String>) -> Self {
+        Self::answering(200, body.into(), true)
+    }
+
+    fn answering(status: u16, body: String, only_once: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub server");
         let url = format!(
             "http://{}/graphql",
             listener.local_addr().expect("stub server address")
         );
-        let body = body.into();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
         thread::spawn(move || {
-            for stream in listener.incoming() {
+            for (served, stream) in listener.incoming().enumerate() {
                 let Ok(stream) = stream else { continue };
-                answer(stream, status, &body);
+                if only_once && served > 0 {
+                    answer(stream, 503, "{}", &recorded);
+                } else {
+                    answer(stream, status, &body, &recorded);
+                }
             }
         });
-        Self { url }
+        Self { url, requests }
+    }
+
+    /// How many requests the viewer has issued so far.
+    pub fn request_count(&self) -> usize {
+        self.requests.lock().expect("stub request log").len()
+    }
+
+    /// The body of the request at `index`, as sent.
+    pub fn request(&self, index: usize) -> String {
+        self.requests.lock().expect("stub request log")[index].clone()
     }
 }
 
-fn answer(mut stream: TcpStream, status: u16, body: &str) {
+fn answer(mut stream: TcpStream, status: u16, body: &str, requests: &Mutex<Vec<String>>) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone stub connection"));
     let mut content_length = 0usize;
     let mut wants_gzip = false;
@@ -77,6 +106,12 @@ fn answer(mut stream: TcpStream, status: u16, body: &str) {
     }
     let mut request_body = vec![0u8; content_length];
     let _ = reader.read_exact(&mut request_body);
+    // Recorded before the answer goes out, so a test that sees the response has
+    // already seen the request.
+    requests
+        .lock()
+        .expect("stub request log")
+        .push(String::from_utf8_lossy(&request_body).into_owned());
 
     let (payload, encoding) = if wants_gzip {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
