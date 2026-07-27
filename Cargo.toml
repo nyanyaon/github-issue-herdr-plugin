@@ -1,0 +1,25 @@
+[package]
+name = "herdr-issues"
+version = "0.1.0"
+edition = "2024"
+description = "Read GitHub issues for the active workspace's repo, in a herdr pane"
+license = "MIT"
+publish = false
+
+[dependencies]
+# Blocking HTTP, one request in flight at a time. `gzip` is a default feature and
+# is worth 14x on the issue list query, so it stays on deliberately.
+ureq = { version = "3.3", default-features = false, features = ["rustls", "gzip", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ratatui = "0.30"
+crossterm = "0.29"
+# SIGHUP: herdr sends it on `pane close`, and the viewer must leave the
+# alternate screen and exit 0. The handler thread blocks on the signal pipe, so
+# it costs nothing while idle.
+signal-hook = "0.4"
+
+[dev-dependencies]
+# The stub GraphQL server gzips its responses, which is how the tests exercise
+# the client's gzip path end to end. Already in the tree via ureq's gzip feature.
+flate2 = "1"
