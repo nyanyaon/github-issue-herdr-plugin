@@ -406,6 +406,7 @@ impl App {
             }
             KeyCode::Char('n') => self.step(1),
             KeyCode::Char('p') => self.step(-1),
+            KeyCode::Char('m') => self.load_more_comments(),
             // `r` means the thing you are looking at, and in this view that is
             // one issue.
             KeyCode::Char('r') => self.refetch_open_issue(),
@@ -476,11 +477,75 @@ impl App {
         cache.issue_detail(&identity.slug, number)
     }
 
+    /// `m` in the detail view: one more page of comments, appended in order.
+    ///
+    /// **Exactly one page, and only the page after the one on screen** — the
+    /// cursor comes from the last page fetched, so pressing `m` on a
+    /// four-hundred-comment thread costs one request each time and never the
+    /// remainder. Nothing here is reachable without a keystroke: the affordance
+    /// is drawn only while the thread has a page left, and this returns at once
+    /// when it does not.
+    ///
+    /// Immediate rather than queued, for the same reason as
+    /// [`App::refetch_open_issue`]: the [`App::has_pending_query`] seam exists
+    /// so a cache-first frame can be drawn *before* a request, and the frame
+    /// this one would draw — the comments already read — is the frame already
+    /// on screen. There is nothing to draw ahead of it.
+    ///
+    /// A failure is a status line and nothing else. The comments already read
+    /// stay exactly where they are, along with the cursor, so `m` can simply be
+    /// pressed again.
+    fn load_more_comments(&mut self) {
+        let Some((number, cursor)) = self.detail.as_ref().and_then(|detail| {
+            let cursor = detail.comments_end_cursor.clone()?;
+            detail.has_more_comments.then_some((detail.number, cursor))
+        }) else {
+            return;
+        };
+        let (Some(client), Some(identity)) = (self.client.as_ref(), self.identity.as_ref()) else {
+            return;
+        };
+        let fetched = client.comment_page(
+            &identity.slug,
+            number,
+            self.detail_comment_page_size,
+            &cursor,
+        );
+
+        match fetched {
+            Ok(page) => {
+                if let (Some(cache), Some(identity)) = (self.cache.as_ref(), self.identity.as_ref())
+                {
+                    // Cached as its own row, with the cursor it ended at, so the
+                    // next pane to open this issue reads the thread this far
+                    // without asking for any of it again.
+                    cache.append_comment_page(&identity.slug, number, &cursor, &page);
+                }
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.comments.extend(page.comments);
+                    detail.has_more_comments = page.has_more_comments;
+                    detail.comments_end_cursor = page.end_cursor;
+                }
+                self.status = None;
+            }
+            Err(error) => self.status = Some(StatusLine::Api(error)),
+        }
+    }
+
     /// `r` in the detail view: re-fetch the issue being read.
     ///
     /// Unconditional, because a refresh is the user saying *ask again* and has
     /// no staleness to consult, and immediate, because the issue a cache-first
     /// frame would draw first is the one already on screen.
+    ///
+    /// **The thread starts again at page one**, however many pages `m` had
+    /// walked. That is SPEC §9's invalidation rule — a re-fetched detail drops
+    /// its cached comment pages — and it applies to a refresh for the same
+    /// reason it applies to a stale issue: the pages already read were asked
+    /// for with cursors into the thread as it was, and a thread that has since
+    /// been edited cannot be continued from them without risking a comment
+    /// shown twice or skipped. The affordance comes back saying what remains,
+    /// and `m` walks it again.
     fn refetch_open_issue(&mut self) {
         let Some(number) = self.detail.as_ref().map(|detail| detail.number) else {
             return;
@@ -502,6 +567,9 @@ impl App {
         let (Some(client), Some(identity)) = (self.client.as_ref(), self.identity.as_ref()) else {
             return;
         };
+        // Read before the request, because a failure changes nothing on screen:
+        // whatever age was being shown is the age still being shown.
+        let cached_at = self.cached_at_on_screen();
         let fetched = client.issue_detail(&identity.slug, number, self.detail_comment_page_size);
 
         match fetched {
@@ -516,8 +584,22 @@ impl App {
                 self.show_detail(detail, index);
                 self.status = None;
             }
-            Err(error) => self.status = Some(StatusLine::Api(error)),
+            Err(error) => self.status = Some(StatusLine::api(error, cached_at)),
         }
+    }
+
+    /// When the data currently on screen was fetched — the age the offline line
+    /// states, since what a failed fetch leaves behind *is* the cache.
+    ///
+    /// Whichever view is up answers for itself: the issue being read in the
+    /// detail view, the rows underneath it otherwise. `None` is a cold start
+    /// with nothing cached, where there is no age to state.
+    fn cached_at_on_screen(&self) -> Option<i64> {
+        match self.view {
+            View::Detail => self.detail.as_ref().map(|detail| detail.fetched_at),
+            View::List => None,
+        }
+        .or_else(|| self.issue_list.as_ref().map(|list| list.fetched_at))
     }
 
     /// Is this row's cached detail behind the list — the `●` of SPEC §11?
@@ -595,6 +677,9 @@ impl App {
         let (Some(client), Some(identity)) = (self.client.as_ref(), self.identity.as_ref()) else {
             return false;
         };
+        // As in [`App::fetch_detail`]: the age of what a failure would leave on
+        // screen, read while it is still unambiguously the age on screen.
+        let cached_at = self.cached_at_on_screen();
         let result = client.issue_list(&identity.slug, self.states, self.list_page_size);
         let fetched = match result {
             Ok(list) => {
@@ -611,7 +696,7 @@ impl App {
                 true
             }
             Err(error) => {
-                self.status = Some(StatusLine::Api(error));
+                self.status = Some(StatusLine::api(error, cached_at));
                 false
             }
         };

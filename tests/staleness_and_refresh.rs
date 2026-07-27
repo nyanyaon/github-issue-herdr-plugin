@@ -502,8 +502,8 @@ fn a_failed_refresh_leaves_the_issue_on_screen() {
         "a failed refresh never clears what is on screen:\n{after}"
     );
     assert!(
-        after.contains("offline · could not reach the GitHub API"),
-        "it is one status line:\n{after}"
+        after.contains("offline · showing cache from just now"),
+        "it is one status line, over the cached issue it left on screen:\n{after}"
     );
     assert_eq!(stub.request_count(), 0, "nothing reached the stub at all");
 }

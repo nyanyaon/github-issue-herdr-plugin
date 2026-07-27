@@ -32,8 +32,10 @@ query($owner:String!,$name:String!,$states:[IssueState!],$first:Int!,$after:Stri
 
 /// The detail query: one issue, its body, and one page of comments.
 ///
-/// `first` is the comment page size, and one page is all this slice fetches —
-/// the `[m]ore` affordance for longer threads is a later ticket.
+/// `first` is the comment page size and `after` is the cursor the last page
+/// ended at, so the same query serves both opening an issue (`after` null) and
+/// the `[m]ore` affordance that walks a long thread one page at a time. Opening
+/// any issue is therefore one round trip however long its thread is.
 const ISSUE_DETAIL_QUERY: &str = r"
 query($owner:String!,$name:String!,$number:Int!,$first:Int!,$after:String){
   repository(owner:$owner,name:$name){
@@ -137,6 +139,21 @@ pub struct IssueComment {
     pub body: String,
 }
 
+/// One page of an issue's comments, and where the thread stands after it.
+///
+/// What the `[m]ore` affordance fetches, and what the cache stores one row per:
+/// the comments themselves plus the cursor the page ended at, which is the only
+/// thing the page after it can be asked for with.
+#[derive(Debug, Clone)]
+pub struct CommentPage {
+    pub comments: Vec<IssueComment>,
+    /// Whether comments remain beyond this page.
+    pub has_more_comments: bool,
+    /// The cursor this page ended at, cached with it so paging can be resumed
+    /// by a later pane.
+    pub end_cursor: Option<String>,
+}
+
 /// The issue detail: body plus the comments fetched so far.
 ///
 /// Cached separately from the list, and separately invalidated.
@@ -155,9 +172,9 @@ pub struct IssueDetail {
     pub comments: Vec<IssueComment>,
     /// Whether comments remain beyond the ones fetched.
     pub has_more_comments: bool,
-    /// The cursor the next comment page would be asked for with. Cached with
-    /// the page it ends, which is what makes paging resumable; asking for that
-    /// page is a later ticket.
+    /// The cursor the next comment page is asked for with — the one the last
+    /// page fetched ended at. Cached with that page, which is what lets a
+    /// later pane resume the thread rather than start it again.
     pub comments_end_cursor: Option<String>,
     /// When this detail was fetched, in unix seconds.
     pub fetched_at: i64,
@@ -196,12 +213,14 @@ impl fmt::Display for ApiError {
                 "token rejected · check GITHUB_TOKEN or run `gh auth login`"
             ),
             Self::NotFound { slug } => write!(f, "{slug} not found — or your token can't see it"),
+            // `[r] retry` because nothing retries by itself: the way out of a
+            // rate limit is a keystroke, and the line has to say so.
             Self::RateLimited {
                 resets_in_minutes: Some(minutes),
-            } => write!(f, "rate limited · resets in {minutes}m"),
+            } => write!(f, "rate limited · resets in {minutes}m · [r] retry"),
             Self::RateLimited {
                 resets_in_minutes: None,
-            } => write!(f, "rate limited"),
+            } => write!(f, "rate limited · [r] retry"),
             Self::Offline => write!(f, "offline · could not reach the GitHub API"),
             Self::Unexpected { message } => write!(f, "github error · {message}"),
         }
@@ -259,26 +278,37 @@ impl GithubClient {
     ///
     /// User-initiated only: `enter` on a row, and `n`/`p` from inside the detail
     /// view. Nothing else fetches, and nothing retries by itself.
+    ///
+    /// **One page, whatever the thread's length** — the rest is asked for a page
+    /// at a time by [`GithubClient::comment_page`], and only when the user asks.
     pub fn issue_detail(
         &self,
         slug: &Slug,
         number: u64,
         comment_page_size: u32,
     ) -> Result<IssueDetail, ApiError> {
-        let body = json!({
-            "query": ISSUE_DETAIL_QUERY,
-            "variables": {
-                "owner": slug.owner,
-                "name": slug.name,
-                "number": number,
-                "first": comment_page_size,
-                // Paging past the first hundred comments is a later ticket.
-                "after": serde_json::Value::Null,
-            }
-        });
-
-        let envelope: Envelope<RepositoryDetail> = self.post(&body)?;
+        let envelope: Envelope<RepositoryDetail> =
+            self.post(&detail_body(slug, number, comment_page_size, None))?;
         envelope.into_issue_detail(slug, number)
+    }
+
+    /// The one page of comments that follows `after` — the `[m]ore` affordance,
+    /// and the whole of what it costs.
+    ///
+    /// The same query as [`GithubClient::issue_detail`] with the cursor filled
+    /// in: the body comes back with it and is thrown away, because the page is
+    /// what was asked for. Exactly one page per press, never the remainder of
+    /// the thread.
+    pub fn comment_page(
+        &self,
+        slug: &Slug,
+        number: u64,
+        comment_page_size: u32,
+        after: &str,
+    ) -> Result<CommentPage, ApiError> {
+        let envelope: Envelope<RepositoryDetail> =
+            self.post(&detail_body(slug, number, comment_page_size, Some(after)))?;
+        envelope.into_comment_page(slug, number)
     }
 
     /// One POST, one response, one status mapping — shared by both queries.
@@ -296,13 +326,16 @@ impl GithubClient {
             return Err(ApiError::TokenRejected);
         }
         if status == 403 || status == 429 {
-            let resets_in_minutes = response
-                .headers()
-                .get("x-ratelimit-reset")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<i64>().ok())
-                .map(|reset| ((reset - age::now()).max(0) + 59) / 60);
-            return Err(ApiError::RateLimited { resets_in_minutes });
+            let headers = response.headers();
+            let header = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.trim().parse::<i64>().ok())
+            };
+            if let Some(rate_limited) = rate_limited(header, age::now()) {
+                return Err(rate_limited);
+            }
         }
         if !(200..300).contains(&status) {
             return Err(ApiError::Unexpected {
@@ -317,6 +350,59 @@ impl GithubClient {
                 message: error.to_string(),
             })
     }
+}
+
+/// Is this 403 or 429 the rate limiter talking, and when does it lift?
+///
+/// The rate-limit headers are read **here and nowhere else**, and only on a
+/// response that already failed — which is the whole of ADR-0005's "remaining
+/// quota is displayed only when a request is actually rate-limited". A
+/// successful response's `x-ratelimit-remaining` is never looked at, so there is
+/// no path by which a quota could reach the screen at any other time.
+///
+/// Both forms GitHub sends: `x-ratelimit-reset` is the primary limit's absolute
+/// unix second, `retry-after` the secondary limit's delay in seconds. A 403
+/// carrying neither is not the rate limiter — it is a forbidden request, and
+/// answering "rate limited" would send the user to wait out a clock that is not
+/// running.
+fn rate_limited(header: impl Fn(&str) -> Option<i64>, now: i64) -> Option<ApiError> {
+    let minutes = |seconds: i64| (seconds.max(0) + 59) / 60;
+    let resets_in_minutes = header("x-ratelimit-reset")
+        .map(|reset| minutes(reset - now))
+        .or_else(|| header("retry-after").map(minutes));
+    match resets_in_minutes {
+        Some(minutes) => Some(ApiError::RateLimited {
+            resets_in_minutes: Some(minutes),
+        }),
+        // Exhausted, but with nothing that says when it lifts.
+        None if header("x-ratelimit-remaining") == Some(0) => Some(ApiError::RateLimited {
+            resets_in_minutes: None,
+        }),
+        None => None,
+    }
+}
+
+/// The detail query's body, for one issue and one page of its comments.
+///
+/// `after` is `None` for the page the issue opens on and the last page's cursor
+/// for every page after it, which is the only difference between the two calls
+/// that send this.
+fn detail_body(
+    slug: &Slug,
+    number: u64,
+    comment_page_size: u32,
+    after: Option<&str>,
+) -> serde_json::Value {
+    json!({
+        "query": ISSUE_DETAIL_QUERY,
+        "variables": {
+            "owner": slug.owner,
+            "name": slug.name,
+            "number": number,
+            "first": comment_page_size,
+            "after": after,
+        }
+    })
 }
 
 /// A GraphQL response body, generic over the shape of `data.repository` — the
@@ -463,17 +549,8 @@ impl Envelope<RepositoryDetail> {
             .issue
             .ok_or(ApiError::NotFound { slug: missing })?;
 
-        let comments = issue
-            .comments
-            .nodes
-            .into_iter()
-            .flatten()
-            .map(|node| IssueComment {
-                author: node.author.map(|author| author.login),
-                created_at: node.created_at.as_deref().and_then(age::parse_timestamp),
-                body: node.body,
-            })
-            .collect();
+        let comment_total_count = issue.comments.total_count;
+        let page = issue.comments.into_page();
 
         Ok(IssueDetail {
             number: issue.number,
@@ -489,12 +566,23 @@ impl Envelope<RepositoryDetail> {
                 .flatten()
                 .map(|label| label.name)
                 .collect(),
-            comment_total_count: issue.comments.total_count,
-            comments,
-            has_more_comments: issue.comments.page_info.has_next_page,
-            comments_end_cursor: issue.comments.page_info.end_cursor,
+            comment_total_count,
+            comments: page.comments,
+            has_more_comments: page.has_more_comments,
+            comments_end_cursor: page.end_cursor,
             fetched_at: age::now(),
         })
+    }
+
+    /// The same response read for its comment page alone — the body and the
+    /// facts came with it, but the issue they belong to is already on screen.
+    fn into_comment_page(self, slug: &Slug, number: u64) -> Result<CommentPage, ApiError> {
+        let missing = format!("{slug}#{number}");
+        let repository = self.into_repository(&missing)?;
+        let issue = repository
+            .issue
+            .ok_or(ApiError::NotFound { slug: missing })?;
+        Ok(issue.comments.into_page())
     }
 }
 
@@ -525,6 +613,28 @@ struct Comments {
     page_info: PageInfo,
     #[serde(default)]
     nodes: Vec<Option<CommentNode>>,
+}
+
+impl Comments {
+    /// The comments this page carried, in the order they were written, with the
+    /// cursor and the has-next flag that decide whether there is a page after
+    /// it.
+    fn into_page(self) -> CommentPage {
+        CommentPage {
+            comments: self
+                .nodes
+                .into_iter()
+                .flatten()
+                .map(|node| IssueComment {
+                    author: node.author.map(|author| author.login),
+                    created_at: node.created_at.as_deref().and_then(age::parse_timestamp),
+                    body: node.body,
+                })
+                .collect(),
+            has_more_comments: self.page_info.has_next_page,
+            end_cursor: self.page_info.end_cursor,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
