@@ -46,24 +46,75 @@ pub struct Request {
     pub authorization: String,
 }
 
+/// One canned HTTP response: the status, the headers that matter to what is
+/// being tested, and the body.
+///
+/// Headers matter because the rate-limited state is not a status code alone —
+/// SPEC §8 reads a 403 as rate limiting only when it carries the rate-limit
+/// headers, so a test has to be able to send them, and to leave them off.
+#[derive(Debug, Clone)]
+pub struct StubResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+impl StubResponse {
+    /// A `200` carrying this GraphQL body.
+    pub fn ok(body: impl Into<String>) -> Self {
+        Self::status(200, body)
+    }
+
+    pub fn status(status: u16, body: impl Into<String>) -> Self {
+        Self {
+            status,
+            headers: Vec::new(),
+            body: body.into(),
+        }
+    }
+
+    pub fn with_header(mut self, name: &str, value: impl ToString) -> Self {
+        self.headers.push((name.to_string(), value.to_string()));
+        self
+    }
+}
+
 impl StubGithub {
     /// Answers every request with `200` and the given GraphQL body.
     pub fn serving(body: impl Into<String>) -> Self {
         let body = body.into();
-        Self::answering(200, move |_request| body.clone(), false)
+        Self::answering(move |_request, _served| StubResponse::ok(body.clone()))
     }
 
     /// Answers every request with the given status and body.
     pub fn responding(status: u16, body: impl Into<String>) -> Self {
         let body = body.into();
-        Self::answering(status, move |_request| body.clone(), false)
+        Self::answering(move |_request, _served| StubResponse::status(status, body.clone()))
+    }
+
+    /// Answers every request with the given canned response — the constructor
+    /// for a failure whose headers are part of what is being tested.
+    pub fn responding_with(response: StubResponse) -> Self {
+        Self::answering(move |_request, _served| response.clone())
+    }
+
+    /// Answers the first request one way and every later one another — how a
+    /// test sees a failure that a `r` gets past, and that the failure's line
+    /// goes with it.
+    pub fn responding_then(first: StubResponse, then: StubResponse) -> Self {
+        Self::answering(move |_request, served| {
+            if served == 0 {
+                first.clone()
+            } else {
+                then.clone()
+            }
+        })
     }
 
     /// Answers the first request with the given body and every later one with
     /// `503` — how a test makes a refresh fail after a start that succeeded.
     pub fn serving_once(body: impl Into<String>) -> Self {
-        let body = body.into();
-        Self::answering(200, move |_request| body.clone(), true)
+        Self::responding_then(StubResponse::ok(body), StubResponse::status(503, "{}"))
     }
 
     /// Answers each request with the body of the first rule whose needle
@@ -77,10 +128,9 @@ impl StubGithub {
             .into_iter()
             .map(|(needle, body)| (squeeze(&needle), body))
             .collect();
-        Self::answering(
-            200,
-            move |request| {
-                let request = squeeze(request);
+        Self::answering(move |request, _served| {
+            let request = squeeze(request);
+            StubResponse::ok(
                 rules
                     .iter()
                     .find(|(needle, _)| request.contains(needle.as_str()))
@@ -90,17 +140,14 @@ impl StubGithub {
                         // request surfaces as a github error on the status line.
                         r#"{"errors":[{"message":"no stub rule matched this request"}]}"#
                             .to_string()
-                    })
-            },
-            false,
-        )
+                    }),
+            )
+        })
     }
 
-    fn answering(
-        status: u16,
-        resolve: impl Fn(&str) -> String + Send + 'static,
-        only_once: bool,
-    ) -> Self {
+    /// The one server every constructor above is built on: a resolver from the
+    /// request body and how many were served before it, to the response.
+    fn answering(resolve: impl Fn(&str, usize) -> StubResponse + Send + 'static) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub server");
         let url = format!(
             "http://{}/graphql",
@@ -111,11 +158,7 @@ impl StubGithub {
         thread::spawn(move || {
             for (served, stream) in listener.incoming().enumerate() {
                 let Ok(stream) = stream else { continue };
-                if only_once && served > 0 {
-                    answer(stream, 503, &|_request| "{}".to_string(), &recorded);
-                } else {
-                    answer(stream, status, &resolve, &recorded);
-                }
+                answer(stream, &|request| resolve(request, served), &recorded);
             }
         });
         Self { url, requests }
@@ -144,8 +187,7 @@ impl StubGithub {
 
 fn answer(
     mut stream: TcpStream,
-    status: u16,
-    resolve: &dyn Fn(&str) -> String,
+    resolve: &dyn Fn(&str) -> StubResponse,
     requests: &Mutex<Vec<Request>>,
 ) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone stub connection"));
@@ -181,18 +223,26 @@ fn answer(
         body: request_body.clone(),
         authorization,
     });
-    let body = resolve(&request_body);
+    let response = resolve(&request_body);
 
     let (payload, encoding) = if wants_gzip {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(body.as_bytes()).expect("gzip the body");
+        encoder
+            .write_all(response.body.as_bytes())
+            .expect("gzip the body");
         (encoder.finish().expect("finish gzip"), "gzip")
     } else {
-        (body.as_bytes().to_vec(), "identity")
+        (response.body.as_bytes().to_vec(), "identity")
     };
 
+    let extra: String = response
+        .headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
     let head = format!(
-        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Encoding: {encoding}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Encoding: {encoding}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        response.status,
         payload.len()
     );
     let _ = stream.write_all(head.as_bytes());
