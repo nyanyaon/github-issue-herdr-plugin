@@ -108,17 +108,11 @@ fn cold_start_renders_a_row_for_each_issue() {
         "rows out of order in:\n{screen}"
     );
 
-    // The keys this slice binds, and only those.
-    for hint in [
-        "j/k move",
-        "enter open",
-        "g/G top/bottom",
-        "/ filter",
-        "o state",
-        "q close",
-    ] {
-        assert!(screen.contains(hint), "{hint:?} missing from:\n{screen}");
-    }
+    // The line ADR-0002 draws under the list, whole.
+    assert!(
+        screen.contains(" j/k move   enter open   / filter   o state   r refresh   q close"),
+        "the key hints are missing from:\n{screen}"
+    );
 }
 
 #[test]
@@ -210,8 +204,8 @@ fn herdr_reserved_keys_are_never_consumed() {
     assert!(!app.should_exit());
 
     // Unbound plain keys do nothing either.
-    // `o` and `enter` are bound now, so neither belongs in this list.
-    for code in [KeyCode::Char('r'), KeyCode::Tab] {
+    // `o`, `enter` and `r` are bound now, so none of them belongs in this list.
+    for code in [KeyCode::Char('x'), KeyCode::Tab] {
         press(&mut app, code);
     }
     assert!(selected_line(&screen(&app, 72, 10)).contains("#7"));
