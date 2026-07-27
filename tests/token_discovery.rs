@@ -21,6 +21,7 @@ use std::cell::Cell;
 use std::fs;
 use std::path::Path;
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use herdr_issues::environment::{Environment, resolve_token};
 use serde_json::json;
 use support::{
@@ -184,6 +185,40 @@ fn the_configured_file_does_not_outrank_a_token_already_resolved() {
     start(&environment.with_config(config.config()));
 
     assert_eq!(stub.authorization(0), "Bearer from-above-the-file");
+}
+
+/// SPEC §5: the token is resolved **once**, at startup, and never re-resolved
+/// for the pane's lifetime.
+///
+/// Which is visible from outside exactly once: take the file away after the
+/// pane has opened, and every later request still carries what startup found.
+/// A token that expires mid-session is a `token rejected` line and a reopened
+/// pane, not a re-resolve.
+#[test]
+fn the_token_is_resolved_once_and_a_later_refresh_re_reads_nothing() {
+    let repo = FixtureRepo::with_origin(REMOTE);
+    let config = ConfigDir::empty();
+    let token_file = config.file("gh-issues", "file-token\n");
+    config.file(
+        "config.toml",
+        &format!("token_file = {:?}\n", token_file.display().to_string()),
+    );
+
+    let stub = StubGithub::serving(issue_list());
+    let mut environment = environment(&repo.path, &stub);
+    environment.token = None;
+    let mut app = start(&environment.with_config(config.config()));
+    assert_eq!(stub.authorization(0), "Bearer file-token");
+
+    fs::remove_file(&token_file).expect("take the token file away");
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+
+    assert_eq!(stub.request_count(), 2, "`r` refreshed the list");
+    assert_eq!(
+        stub.authorization(1),
+        "Bearer file-token",
+        "the refresh carried the token startup resolved, from a file that is gone"
+    );
 }
 
 /// The token file is read, and only read. A credential the user owns stays a
