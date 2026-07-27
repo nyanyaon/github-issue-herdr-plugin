@@ -15,9 +15,19 @@ use crate::app::App;
 use crate::github::{IssueComment, IssueDetail};
 use crate::ui::{markdown, status, truncate};
 
-/// The line ADR-0002 draws under the detail view, verbatim. `m` (load more
-/// comments) is a later ticket, so it is not advertised.
+/// The line ADR-0002 draws under the detail view, verbatim — sixty-one columns
+/// of the seventy-two a half-width pane has.
 const KEY_HINTS: &str = " esc back   j/k scroll   n/p next issue   r refresh   q close";
+
+/// The same line with `m` in it, for a thread that still has a page to load.
+///
+/// Seventy columns, which fits the pane the ADR settled the line at with two to
+/// spare — but only just, so it is drawn **only while `m` does something**.
+/// That is the same rule the `[m]ore` line above it follows, and it keeps the
+/// footer from advertising a key that would do nothing on the great majority of
+/// issues, which have one page of comments or none.
+const KEY_HINTS_WITH_MORE: &str =
+    " esc back   j/k scroll   n/p next issue   m more   r refresh   q close";
 
 /// A one-column left margin, so prose never starts against the pane edge.
 const MARGIN: u16 = 1;
@@ -44,10 +54,17 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_rule(frame, bottom_rule);
     match app.status() {
         Some(line) => status::render(frame, footer, line),
-        None => frame.render_widget(
-            Line::from(KEY_HINTS).style(Style::default().fg(Color::DarkGray)),
-            footer,
-        ),
+        None => {
+            let hints = if detail.has_more_comments {
+                KEY_HINTS_WITH_MORE
+            } else {
+                KEY_HINTS
+            };
+            frame.render_widget(
+                Line::from(hints).style(Style::default().fg(Color::DarkGray)),
+                footer,
+            );
+        }
     }
 }
 
@@ -146,7 +163,38 @@ fn content_lines(detail: &IssueDetail, width: usize, now: i64) -> Vec<Line<'stat
         lines.push(comment_rule(comment, width, now));
         lines.extend(markdown::render(&comment.body, width));
     }
+    if detail.has_more_comments {
+        lines.push(Line::default());
+        lines.push(more_comments_rule(detail, width));
+    }
     lines
+}
+
+/// `───── 7 more comments · [m]ore ────────────────────`.
+///
+/// Drawn **only when a page remains**, so the thread ends with the affordance
+/// exactly while there is something behind it, and ends without one as soon as
+/// the last page has been read. The count is what the issue says it has minus
+/// what has arrived — the remainder `m` would work through, a page at a time.
+fn more_comments_rule(detail: &IssueDetail, width: usize) -> Line<'static> {
+    let remaining = detail
+        .comment_total_count
+        .saturating_sub(detail.comments.len() as u64);
+    let label = match remaining {
+        // The count comes from the list row rather than the page, so it can be
+        // behind what has actually arrived. The affordance is still honest —
+        // GitHub said there is another page — so it is drawn without a number
+        // rather than with a wrong one.
+        0 => "───── more comments · [m]ore ".to_string(),
+        1 => "───── 1 more comment · [m]ore ".to_string(),
+        many => format!("───── {many} more comments · [m]ore "),
+    };
+    let fill = width.saturating_sub(label.chars().count());
+    let rule = format!("{label}{}", "─".repeat(fill));
+    Line::from(Span::styled(
+        truncate(&rule, width),
+        Style::default().fg(Color::DarkGray),
+    ))
 }
 
 /// `── nyanyaon · 18m ago ─────────────────────────────`.
