@@ -18,6 +18,9 @@ crossterm = "0.29"
 # alternate screen and exit 0. The handler thread blocks on the signal pipe, so
 # it costs nothing while idle.
 signal-hook = "0.4"
+# `config.toml`. Parsed as a plain table rather than derived onto a struct, so
+# an unknown key can warn and be ignored instead of failing the whole file.
+toml = "1"
 
 [dev-dependencies]
 # The stub GraphQL server gzips its responses, which is how the tests exercise
