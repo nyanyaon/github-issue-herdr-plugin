@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 
+use crate::config::{self, ConfigWarning};
 use crate::github::{ApiError, IssueStates};
 use crate::identity::IdentityError;
 
@@ -20,6 +21,13 @@ pub enum StatusLine {
     Api(ApiError),
     /// The query succeeded and returned nothing for the state it asked for.
     Empty(IssueStates),
+    /// `config.toml` was read and something in it was ignored.
+    ///
+    /// The least urgent line there is — nothing is broken, and the defaults are
+    /// already in force — so it shows whenever nothing else needs the line, and
+    /// keeps showing for the pane's lifetime. The config is read once at
+    /// startup, so the warning stays true until the pane is reopened.
+    Config(Vec<ConfigWarning>),
 }
 
 impl fmt::Display for StatusLine {
@@ -36,6 +44,11 @@ impl fmt::Display for StatusLine {
                 write!(f, "no closed issues · [o] to include all")
             }
             Self::Empty(IssueStates::All) => write!(f, "no issues"),
+            // The file is named once, then every clause it earned.
+            Self::Config(warnings) => {
+                let clauses: Vec<String> = warnings.iter().map(ToString::to_string).collect();
+                write!(f, "{} · {}", config::FILE_NAME, clauses.join(" · "))
+            }
         }
     }
 }

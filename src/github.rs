@@ -177,9 +177,11 @@ pub enum ApiError {
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // All three ways to provide one, in SPEC §11's words — `token_file`
+            // included now that the config file it comes from exists.
             Self::NoToken => write!(
                 f,
-                "no GitHub token found · set GITHUB_TOKEN or run `gh auth login`"
+                "no GitHub token found · set GITHUB_TOKEN, run `gh auth login`, or set token_file"
             ),
             Self::TokenRejected => write!(
                 f,

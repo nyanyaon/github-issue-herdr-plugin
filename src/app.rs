@@ -16,15 +16,6 @@ use crate::identity::RepoIdentity;
 use crate::ui;
 use crate::ui::status::StatusLine;
 
-/// How many issues the list query asks for. The config file that makes this
-/// tunable is a later ticket.
-const LIST_PAGE_SIZE: u32 = 50;
-
-/// How many comments one detail query asks for — GraphQL's maximum, and the
-/// whole thread for all but the longest issues. Paging past it is a later
-/// ticket.
-const DETAIL_COMMENT_PAGE_SIZE: u32 = 100;
-
 /// The two screens. There is no third.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
@@ -63,6 +54,9 @@ pub struct App {
     filter: String,
     mode: Mode,
     status: Option<StatusLine>,
+    /// What `config.toml` got wrong, if anything — the line shown whenever
+    /// nothing more urgent needs the status line, for the pane's lifetime.
+    config_status: Option<StatusLine>,
     view: View,
     /// An index into the *visible* rows, not into the fetched list.
     selected: usize,
@@ -70,6 +64,10 @@ pub struct App {
     /// only place the content's height is known, and it clamps this there.
     detail_scroll: Cell<usize>,
     exit: bool,
+    /// `list_page_size` and `detail_comment_page_size`, from `config.toml`.
+    /// Fixed for the pane's lifetime, like everything else the config decides.
+    list_page_size: u32,
+    detail_comment_page_size: u32,
 }
 
 impl App {
@@ -88,10 +86,16 @@ impl App {
             filter: String::new(),
             mode: Mode::Normal,
             status: None,
+            // Set before anything can fail, so a config warning survives every
+            // early return below.
+            config_status: (!environment.config_warnings.is_empty())
+                .then(|| StatusLine::Config(environment.config_warnings.clone())),
             view: View::List,
             selected: 0,
             detail_scroll: Cell::new(0),
             exit: false,
+            list_page_size: environment.list_page_size,
+            detail_comment_page_size: environment.detail_comment_page_size,
         };
 
         let identity = match crate::identity::resolve(environment) {
@@ -196,8 +200,15 @@ impl App {
         self.issue_list.as_ref()
     }
 
+    /// The line the pane shows, and the only one it has.
+    ///
+    /// A config warning is the least urgent thing there is — nothing is broken
+    /// and the defaults are already in force — so it yields to a failure or an
+    /// empty list and comes back when that clears. Because it is *derived* here
+    /// rather than written into `status`, no fetch can overwrite it: it is on
+    /// screen for as long as the file it describes is the one that was read.
     pub fn status(&self) -> Option<&StatusLine> {
-        self.status.as_ref()
+        self.status.as_ref().or(self.config_status.as_ref())
     }
 
     /// An index into [`App::visible_rows`].
@@ -273,7 +284,7 @@ impl App {
         let (Some(client), Some(identity)) = (self.client.as_ref(), self.identity.as_ref()) else {
             return;
         };
-        match client.issue_detail(&identity.slug, number, DETAIL_COMMENT_PAGE_SIZE) {
+        match client.issue_detail(&identity.slug, number, self.detail_comment_page_size) {
             Ok(detail) => {
                 self.detail = Some(detail);
                 self.detail_scroll.set(0);
@@ -340,7 +351,7 @@ impl App {
         let (Some(client), Some(identity)) = (self.client.as_ref(), self.identity.as_ref()) else {
             return false;
         };
-        let result = client.issue_list(&identity.slug, self.states, LIST_PAGE_SIZE);
+        let result = client.issue_list(&identity.slug, self.states, self.list_page_size);
         let fetched = match result {
             Ok(list) => {
                 self.status = list

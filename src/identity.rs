@@ -59,9 +59,8 @@ impl fmt::Display for Slug {
 /// collapsed onto their source repo by the time a key is looked up, so one entry
 /// covers every worktree of a repo.
 ///
-/// Nothing populates it yet — the config file is a later ticket, and
-/// [`Environment::from_process`] always builds it empty. This type is the shape
-/// that ticket has to produce: pairs of repo root and slug, both already parsed.
+/// [`crate::config::Config`] populates it: each `slug` value goes through
+/// [`Slug::parse`], so what arrives here is always a parsed `owner/repo`.
 #[derive(Debug, Clone, Default)]
 pub struct SlugOverrides {
     entries: Vec<(PathBuf, Slug)>,
