@@ -147,7 +147,7 @@ fn enter_opens_the_detail_view_and_esc_returns_with_the_selection_intact() {
     assert!(opened.contains("‹ #42 Walking skeleton"), "{opened}");
     assert!(opened.contains("The pane, end to end."), "{opened}");
     assert!(
-        opened.contains("esc back   j/k scroll   n/p next issue   q close"),
+        opened.contains("esc back   j/k scroll   n/p next issue   r refresh   q close"),
         "{opened}"
     );
     // The list is gone, not drawn behind the detail.

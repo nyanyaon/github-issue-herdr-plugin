@@ -14,6 +14,7 @@
 //! migrations: a version bump migrates rather than wipes, because an old pane
 //! and a new one may share this file during an upgrade.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -134,8 +135,23 @@ impl Cache {
     }
 
     /// Writes a fetched detail through, with its comment page.
+    ///
+    /// Every comment page cached for the issue goes with the body it belonged
+    /// to, and the thread starts again at page one (ADR-0001).
     pub fn save_issue_detail(&self, slug: &Slug, detail: &IssueDetail) {
         let _ = self.write_issue_detail(slug, detail);
+    }
+
+    /// The `updatedAt` each cached detail of this repo was fetched at, by issue
+    /// number — the other half of the staleness comparison.
+    ///
+    /// A row is **stale** when the list's `updatedAt` differs from the one
+    /// recorded here; an issue absent from this map has no cached detail at
+    /// all, which is not the same thing as having a stale one. One query for
+    /// the whole repo, because the marker is wanted for every row at once, and
+    /// no clock is consulted anywhere in it.
+    pub fn detail_updated_at(&self, slug: &Slug) -> HashMap<u64, Option<i64>> {
+        self.read_detail_updated_at(slug).unwrap_or_default()
     }
 
     /// Records that a pane displayed this repo, which is what the startup prune
@@ -240,6 +256,20 @@ impl Cache {
             }
         }
         transaction.commit()
+    }
+
+    fn read_detail_updated_at(&self, slug: &Slug) -> rusqlite::Result<HashMap<u64, Option<i64>>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT number, updated_at FROM issue_detail WHERE slug = ?1")?;
+        let ages = statement.query_map(params![slug.to_string()], |row| {
+            let updated_at: Option<String> = row.get(1)?;
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                updated_at.as_deref().and_then(age::parse_timestamp),
+            ))
+        })?;
+        ages.collect()
     }
 
     fn read_issue_detail(&self, slug: &Slug, number: u64) -> rusqlite::Result<Option<IssueDetail>> {
@@ -495,6 +525,87 @@ mod tests {
             Some("Y3Vyc29yOnYyOpHOAA")
         );
         assert_eq!(read.fetched_at, 1_785_143_643);
+    }
+
+    /// Re-fetching an issue drops **every** page cached for it, not just the
+    /// one it replaces, and starts the thread again at page one (ADR-0001).
+    ///
+    /// Only the first page is ever fetched so far, so the second page here is
+    /// written straight into the table — the same standing this file's
+    /// migration test has, which asserts against a schema step that does not
+    /// exist yet either.
+    #[test]
+    fn a_re_fetch_drops_every_comment_page_and_starts_again_at_the_first() {
+        let cache = Cache::open_at(&temp_database("pages")).expect("open the cache");
+        cache.save_issue_list(&slug(), &list_with_one_row());
+        cache.save_issue_detail(&slug(), &detail_with_comments());
+        cache
+            .connection
+            .execute(
+                "INSERT INTO issue_comments (slug, number, page, nodes_json, end_cursor, has_next)
+                 VALUES (?1, 7, 2, ?2, 'Y3Vyc29yOnYyOpHOBB', 0)",
+                params![
+                    slug().to_string(),
+                    r#"[{"author":"octocat","created_at":null,"body":"The hundred and first."}]"#,
+                ],
+            )
+            .expect("cache a second page the way paging would");
+        assert_eq!(
+            cache
+                .issue_detail(&slug(), 7)
+                .expect("the two-page thread")
+                .comments
+                .len(),
+            2
+        );
+
+        // The issue moved on, so the pane fetched it again.
+        let mut re_fetched = detail_with_comments();
+        re_fetched.body = "One column, drill-in. Now with a marker.".to_string();
+        re_fetched.comments[0].body = "The first of many, edited.".to_string();
+        re_fetched.has_more_comments = false;
+        re_fetched.comments_end_cursor = None;
+        cache.save_issue_detail(&slug(), &re_fetched);
+
+        let pages: Vec<i64> = cache
+            .connection
+            .prepare("SELECT page FROM issue_comments WHERE slug = ?1 AND number = 7 ORDER BY page")
+            .expect("read the cached pages")
+            .query_map(params![slug().to_string()], |row| row.get(0))
+            .expect("read the cached pages")
+            .collect::<rusqlite::Result<Vec<i64>>>()
+            .expect("read the cached pages");
+        assert_eq!(
+            pages,
+            vec![FIRST_COMMENT_PAGE],
+            "the thread restarts at the first page"
+        );
+
+        let read = cache
+            .issue_detail(&slug(), 7)
+            .expect("the re-fetched detail");
+        assert_eq!(read.comments.len(), 1);
+        assert_eq!(read.comments[0].body, "The first of many, edited.");
+        assert!(!read.has_more_comments);
+        assert_eq!(read.comments_end_cursor, None);
+    }
+
+    /// The other half of the staleness comparison, straight off the table it is
+    /// read from. An issue with no cached detail is simply absent — there is
+    /// nothing behind the list for it to be.
+    #[test]
+    fn cached_detail_ages_are_reported_per_issue() {
+        let cache = Cache::open_at(&temp_database("ages")).expect("open the cache");
+        cache.save_issue_list(&slug(), &list_with_one_row());
+        cache.save_issue_detail(&slug(), &detail_with_comments());
+
+        let ages = cache.detail_updated_at(&slug());
+
+        assert_eq!(
+            ages.get(&7).copied(),
+            Some(age::parse_timestamp("2026-07-27T09:14:03Z"))
+        );
+        assert_eq!(ages.get(&8), None, "an issue never read has no cached age");
     }
 
     /// The criterion that is easy to claim and hard to have got right: a file

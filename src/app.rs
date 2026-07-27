@@ -6,6 +6,7 @@
 //! GraphQL endpoint.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -55,12 +56,29 @@ pub struct App {
     ///
     /// It is a flag rather than a call inside [`App::start`] because the frame
     /// between the two is the whole point: the event loop draws, sees this, runs
-    /// the query, and draws again. Once it is cleared nothing sets it again in
-    /// this slice, so the pane goes back to blocking on input.
+    /// the query, and draws again. Once it is cleared only a keystroke can set
+    /// it again, so the pane goes back to blocking on input.
     pending_list_query: bool,
+    /// The detail re-fetch that opening a **stale** issue queues, for the same
+    /// reason and through the same seam as the list query above: the cached
+    /// issue is drawn first, and the request goes out after that frame.
+    ///
+    /// Only ever set for an issue the cache could already answer for. An issue
+    /// never read has nothing to draw ahead of its request, so it is fetched
+    /// there and then instead.
+    pending_detail_fetch: Option<u64>,
     states: IssueStates,
     issue_list: Option<IssueList>,
     detail: Option<IssueDetail>,
+    /// The `updatedAt` every cached detail of this repo was fetched at, by
+    /// issue number — what each list row's own `updatedAt` is compared against.
+    ///
+    /// Read from the cache when the pane opens and again whenever a detail is
+    /// written through, which is the only way it can change. Never a clock:
+    /// **staleness is a disagreement between two timestamps GitHub issued**,
+    /// and holding the map costs one query per fetch rather than one per row
+    /// per render.
+    cached_detail_updated_at: HashMap<u64, Option<i64>>,
     /// The filter text. Applied to the cached rows at render time; changing it
     /// never touches the network.
     filter: String,
@@ -101,9 +119,11 @@ impl App {
             client: None,
             cache: None,
             pending_list_query: false,
+            pending_detail_fetch: None,
             states: IssueStates::default(),
             issue_list: None,
             detail: None,
+            cached_detail_updated_at: HashMap::new(),
             filter: String::new(),
             mode: Mode::Normal,
             status: None,
@@ -152,25 +172,29 @@ impl App {
         app
     }
 
-    /// Whether the startup list query is still to run.
+    /// Whether a query the pane has already drawn for is still to run.
     ///
     /// The event loop asks this after every draw, which is what puts the cached
-    /// frame on screen before the request goes out.
+    /// frame on screen before the request goes out — at startup for the list,
+    /// and again whenever a **stale** issue is opened onto its cached body.
     pub fn has_pending_query(&self) -> bool {
-        self.pending_list_query
+        self.pending_list_query || self.pending_detail_fetch.is_some()
     }
 
-    /// Runs the startup list query — SPEC §5 step 6's "then run the list query
-    /// and re-render".
+    /// Runs whichever query the last frame was drawn ahead of — SPEC §5 step 6's
+    /// "then run the list query and re-render", and the same move for one issue.
     ///
     /// Cache-first does not mean network-never: without this a warm pane would
     /// show yesterday's rows with no way to move past them.
     pub fn run_pending_query(&mut self) {
-        if !self.pending_list_query {
+        if self.pending_list_query {
+            self.pending_list_query = false;
+            self.refresh_list();
             return;
         }
-        self.pending_list_query = false;
-        self.refresh_list();
+        if let Some(number) = self.pending_detail_fetch.take() {
+            self.fetch_detail(number, self.selected);
+        }
     }
 
     /// Puts the cached rows on screen, before anything has been asked of the
@@ -181,10 +205,24 @@ impl App {
         };
         cache.mark_opened(&identity.slug);
         self.issue_list = cache.issue_list(&identity.slug, self.states);
+        self.load_cached_detail_ages();
+    }
+
+    /// Re-reads the cached details' `updatedAt`s, which is the only thing the
+    /// staleness marker is drawn from.
+    ///
+    /// Called when the pane opens and after every detail written through — the
+    /// two moments the answer can change. A list refresh moves the *other* side
+    /// of the comparison and needs nothing from here.
+    fn load_cached_detail_ages(&mut self) {
+        self.cached_detail_updated_at = match (self.cache.as_ref(), self.identity.as_ref()) {
+            (Some(cache), Some(identity)) => cache.detail_updated_at(&identity.slug),
+            _ => HashMap::new(),
+        };
     }
 
     /// The keys the list view binds: `j`/`k`, the arrows, `g`/`G`, `enter`, `/`,
-    /// `esc`, `o`, `q`. The detail view's own keys are in
+    /// `esc`, `o`, `r`, `q`. The detail view's own keys are in
     /// [`App::handle_detail_key`].
     ///
     /// Anything carrying Control or Alt is ignored outright, so `ctrl+b` and
@@ -221,6 +259,11 @@ impl App {
             KeyCode::Char('/') => self.mode = Mode::Filtering,
             KeyCode::Esc => self.clear_filter(),
             KeyCode::Char('o') => self.cycle_states(),
+            // `r` means the thing you are looking at, and in this view that is
+            // the list.
+            KeyCode::Char('r') => {
+                self.refresh_list();
+            }
             KeyCode::Char('q') => self.exit = true,
             _ => {}
         }
@@ -298,7 +341,8 @@ impl App {
         self.detail_scroll.set(self.detail_scroll.get().min(max));
     }
 
-    /// `esc` back, `j`/`k` scroll, `n`/`p` next and previous issue, `q` close.
+    /// `esc` back, `j`/`k` scroll, `n`/`p` next and previous issue, `r`
+    /// re-fetch, `q` close.
     ///
     /// `n` and `p` follow the list's order and stay in the detail view, so a
     /// run of issues reads without a trip back to the list.
@@ -307,6 +351,9 @@ impl App {
             KeyCode::Esc => {
                 self.view = View::List;
                 self.detail = None;
+                // Leaving takes the queued re-fetch with it: the issue it was
+                // for is no longer the thing on screen.
+                self.pending_detail_fetch = None;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.detail_scroll.set(self.detail_scroll.get() + 1);
@@ -317,6 +364,9 @@ impl App {
             }
             KeyCode::Char('n') => self.step(1),
             KeyCode::Char('p') => self.step(-1),
+            // `r` means the thing you are looking at, and in this view that is
+            // one issue.
+            KeyCode::Char('r') => self.refetch_open_issue(),
             KeyCode::Char('q') => self.exit = true,
             _ => {}
         }
@@ -336,48 +386,107 @@ impl App {
         self.open(target);
     }
 
-    /// Fetches one issue's detail and shows it — the only thing besides startup
-    /// that touches the network, and only ever because a key asked it to.
+    /// Opens one issue, asking the network for it only when the cache cannot
+    /// answer.
     ///
-    /// On failure the status line says why and the view does not change: a
-    /// failed fetch never clears what is already on screen.
+    /// Three cases, and they are the whole of the refresh policy:
+    ///
+    /// - **Unchanged** — the body was fetched at the `updatedAt` the list row
+    ///   still carries, so the cache *is* the answer and **no request is issued
+    ///   at all**.
+    /// - **Stale** — the two disagree, so the cached issue goes on screen now
+    ///   and the re-fetch is queued for after that frame. Cache-first is the
+    ///   same rule here as at startup: nothing waits on the network to be
+    ///   readable.
+    /// - **Never read** — there is nothing to draw ahead of the request, so it
+    ///   goes out at once.
+    ///
     /// `index` counts the *visible* rows, so `enter` under a filter opens the
     /// issue that is actually under the cursor rather than the nth fetched one.
     fn open(&mut self, index: usize) {
-        let Some(number) = self.visible_rows().get(index).map(|row| row.number) else {
+        let Some((number, stale)) = self
+            .visible_rows()
+            .get(index)
+            .map(|row| (row.number, self.is_stale(row)))
+        else {
             return;
         };
+        match self.cached_detail(number) {
+            Some(detail) if !stale => self.show_detail(detail, index),
+            Some(detail) => {
+                self.show_detail(detail, index);
+                self.pending_detail_fetch = Some(number);
+            }
+            None => self.fetch_detail(number, index),
+        }
+    }
+
+    /// The cached detail for one issue, or `None` when the cache has never held
+    /// it — or when there is no cache at all, which is the viewer outside herdr.
+    ///
+    /// Not where staleness is decided: the detail this answers with carries the
+    /// *list row's* `updatedAt`, because that is the issue's current age and
+    /// what the header should say. The `updatedAt` the body was fetched at is
+    /// the column [`App::is_stale`] reads, and the two disagreeing is precisely
+    /// what stale means.
+    fn cached_detail(&self, number: u64) -> Option<IssueDetail> {
+        let (cache, identity) = (self.cache.as_ref()?, self.identity.as_ref()?);
+        cache.issue_detail(&identity.slug, number)
+    }
+
+    /// `r` in the detail view: re-fetch the issue being read.
+    ///
+    /// Unconditional, because a refresh is the user saying *ask again* and has
+    /// no staleness to consult, and immediate, because the issue a cache-first
+    /// frame would draw first is the one already on screen.
+    fn refetch_open_issue(&mut self) {
+        let Some(number) = self.detail.as_ref().map(|detail| detail.number) else {
+            return;
+        };
+        // Whatever this view was opened owing, it is about to be paid.
+        self.pending_detail_fetch = None;
+        self.fetch_detail(number, self.selected);
+    }
+
+    /// Fetches one issue's detail, writes it through and shows it — the only
+    /// thing besides the list query that touches the network, and only ever
+    /// because a key asked it to.
+    ///
+    /// On failure the status line says why and the view does not change: a
+    /// failed fetch never clears what is already on screen, whether that is a
+    /// cached issue this call was going to replace or the list it was called
+    /// from.
+    fn fetch_detail(&mut self, number: u64, index: usize) {
         let (Some(client), Some(identity)) = (self.client.as_ref(), self.identity.as_ref()) else {
             return;
         };
-        // Read before the request goes out, and shown when the request does not
-        // come back: a failed fetch never clears what the cache holds. Drawing
-        // it *first*, a frame ahead of the request, waits on the staleness rules
-        // that decide whether a cached detail needs a request at all — until
-        // then every open re-fetches, so an intermediate frame would only
-        // flicker.
-        let cached = self
-            .cache
-            .as_ref()
-            .and_then(|cache| cache.issue_detail(&identity.slug, number));
         let fetched = client.issue_detail(&identity.slug, number, self.detail_comment_page_size);
 
         match fetched {
             Ok(detail) => {
                 if let (Some(cache), Some(identity)) = (self.cache.as_ref(), self.identity.as_ref())
                 {
+                    // Which also drops the comment pages cached for this issue
+                    // and starts the thread again at page one.
                     cache.save_issue_detail(&identity.slug, &detail);
                 }
+                self.load_cached_detail_ages();
                 self.show_detail(detail, index);
                 self.status = None;
             }
-            Err(error) => {
-                if let Some(detail) = cached {
-                    self.show_detail(detail, index);
-                }
-                self.status = Some(StatusLine::Api(error));
-            }
+            Err(error) => self.status = Some(StatusLine::Api(error)),
         }
+    }
+
+    /// Is this row's cached detail behind the list — the `●` of SPEC §11?
+    ///
+    /// A **disagreement between two `updatedAt`s GitHub issued**, and nothing
+    /// else: no clock, no threshold, no TTL. A row whose detail has never been
+    /// read is not stale — there is nothing behind the list to mark.
+    pub fn is_stale(&self, row: &IssueRow) -> bool {
+        self.cached_detail_updated_at
+            .get(&row.number)
+            .is_some_and(|cached| *cached != row.updated_at)
     }
 
     /// Puts one issue on screen, wherever it came from.
@@ -435,8 +544,9 @@ impl App {
         }
     }
 
-    /// The only place the issue list is queried. Cache-first: a failure becomes
-    /// a status line and leaves the rows already on screen exactly as they are.
+    /// The only place the issue list is queried — at startup, on `o`, and on
+    /// `r` in the list view. Cache-first: a failure becomes a status line and
+    /// leaves the rows already on screen exactly as they are.
     ///
     /// Answers whether the list on screen is now the one for [`App::states`].
     fn refresh_list(&mut self) -> bool {
