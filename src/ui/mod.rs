@@ -1,5 +1,6 @@
 //! The pane's chrome. One column, one status line, never a modal.
 
+pub mod detail;
 pub mod list;
 pub mod markdown;
 pub mod status;

@@ -110,7 +110,7 @@ fn cold_start_renders_a_row_for_each_issue() {
 
     // The keys this slice binds, and only those.
     assert!(
-        screen.contains("j/k move   g/G top/bottom   q close"),
+        screen.contains("j/k move   enter open   g/G top/bottom   q close"),
         "{screen}"
     );
 }
@@ -204,7 +204,7 @@ fn herdr_reserved_keys_are_never_consumed() {
     assert!(!app.should_exit());
 
     // Unbound plain keys do nothing either.
-    for code in [KeyCode::Char('r'), KeyCode::Char('o'), KeyCode::Enter] {
+    for code in [KeyCode::Char('r'), KeyCode::Char('o'), KeyCode::Tab] {
         press(&mut app, code);
     }
     assert!(selected_line(&screen(&app, 72, 10)).contains("#7"));

@@ -19,9 +19,9 @@ const LABEL_WIDTH: usize = 12;
 const COUNT_WIDTH: usize = 3;
 const AGE_WIDTH: usize = 4;
 
-/// The keys this slice binds, and nothing else. `enter`, `/`, `o` and `r` are
-/// later tickets, so they are not advertised.
-const KEY_HINTS: &str = " j/k move   g/G top/bottom   q close";
+/// The keys this slice binds, and nothing else. `/`, `o` and `r` are later
+/// tickets, so they are not advertised.
+const KEY_HINTS: &str = " j/k move   enter open   g/G top/bottom   q close";
 
 pub fn render(frame: &mut Frame, app: &App) {
     let [header, top_rule, rows, bottom_rule, footer] = Layout::vertical([
