@@ -1,0 +1,84 @@
+name: ci
+
+# Every gate the branches have been held to by hand, run automatically.
+#
+# Until this existed a pull request could go green with no evidence at all —
+# each branch was verified locally and merged on trust. The four commands below
+# are exactly the ones the contributing loop already uses, so nothing here is a
+# new standard, only an enforced one.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on warnings everywhere, not only in the clippy step.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: build, test, clippy, fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: rustup component add clippy rustfmt
+
+      # `rusqlite` is vendored with `bundled`, so every cold run compiles SQLite
+      # from C. That dominates the wall clock; caching it is the difference
+      # between a minute and several.
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Formatting first: it is the cheapest to run and the cheapest to fix, so
+      # failing here costs no compile time.
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo build
+        run: cargo build --locked
+
+      # `--all-targets` so the test files are linted too — they are most of the
+      # code in this repo.
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked
+
+  # The install script is a product surface: it downloads and executes a binary
+  # on a user's machine, and it is the one part of this repo that never runs in
+  # `cargo test`. Lint it on every change instead.
+  scripts:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: shellcheck
+        run: shellcheck --shell=sh --severity=style scripts/*.sh
+
+      # A syntax error in a POSIX-sh script is invisible until the branch that
+      # uses it runs. dash is what /bin/sh actually is on most Linux distros.
+      - name: Parse under dash and bash
+        run: |
+          for script in scripts/*.sh; do
+            dash -n "${script}"
+            bash -n "${script}"
+          done
