@@ -4,3 +4,5 @@
 //! description, fed key events, rendered into a terminal backend. Everything
 //! below that seam is real: a real HTTP client, a real `git`, a real repo root.
 //! Only the GitHub endpoint is substitutable.
+
+pub mod identity;
