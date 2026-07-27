@@ -53,9 +53,17 @@ id = "issues"
 title = "Issues"
 placement = "split"
 command = ["./bin/herdr-issues"]
+
+[[actions]]
+id = "open"
+title = "Open issues pane"
+contexts = ["workspace"]
+command = ["/bin/sh", "-c", "\"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint issues"]
 ```
 
 `[[build]]` runs on `herdr plugin install` only, never on `plugin link`. The pane command's working directory is the plugin root, so the relative path resolves. No `[[startup]]`, no `[[events]]` — the plugin does nothing when its pane isn't open.
+
+The `open` action exists **only** so §14's keybinding has something to name: a `[[keys.command]]` of `type = "plugin_action"` resolves an *action* id, never a pane entrypoint id — verified against herdr 0.7.5, where naming the pane answers `plugin_action_not_found`. It holds no logic; it asks herdr to open the pane declared above and exits.
 
 Optional later, additive: `[[link_handlers]]` matching `^https://github\.com/[^/]+/[^/]+/issues/[0-9]+$` so a modified-click on an issue URL in an agent pane opens it here.
 
