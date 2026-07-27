@@ -9,7 +9,7 @@ mod support;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use herdr_issues::app::App;
 use serde_json::json;
-use support::{FixtureRepo, StubGithub, environment, screen, seconds_ago};
+use support::{FixtureRepo, StubGithub, environment, screen, seconds_ago, start};
 
 const REMOTE: &str = "https://github.com/nyanyaon/github-issue-herdr-plugin";
 const SLUG: &str = "nyanyaon/github-issue-herdr-plugin";
@@ -107,7 +107,7 @@ fn slash_filters_on_title_number_label_and_author_at_once() {
         ("PROTOTYPE", 7), // case-insensitive
         ("pane ui", 7),   // a fragment spanning two words
     ] {
-        let mut app = App::start(&environment(&repo.path, &stub));
+        let mut app = start(&environment(&repo.path, &stub));
         press(&mut app, KeyCode::Char('/'));
         type_text(&mut app, query);
 
@@ -135,7 +135,7 @@ fn the_filter_is_fuzzy_rather_than_a_substring() {
         ("ptype", 7),   // the "prototype" label, missing its middle
         ("ocat", 42),   // the "octocat" author, missing its middle
     ] {
-        let mut app = App::start(&environment(&repo.path, &stub));
+        let mut app = start(&environment(&repo.path, &stub));
         press(&mut app, KeyCode::Char('/'));
         type_text(&mut app, query);
 
@@ -152,7 +152,7 @@ fn the_filter_is_fuzzy_rather_than_a_substring() {
 fn the_header_counts_the_filtered_rows_against_the_total() {
     let repo = FixtureRepo::with_origin(REMOTE);
     let stub = StubGithub::serving(issue_list(three_issues()));
-    let mut app = App::start(&environment(&repo.path, &stub));
+    let mut app = start(&environment(&repo.path, &stub));
 
     let full = screen(&app, 72, 10);
     assert!(full.contains(&format!(" {SLUG} · 3 open · ")), "{full}");
@@ -180,7 +180,7 @@ fn the_header_counts_the_filtered_rows_against_the_total() {
 fn esc_clears_the_filter_and_restores_the_full_list() {
     let repo = FixtureRepo::with_origin(REMOTE);
     let stub = StubGithub::serving(issue_list(three_issues()));
-    let mut app = App::start(&environment(&repo.path, &stub));
+    let mut app = start(&environment(&repo.path, &stub));
 
     press(&mut app, KeyCode::Char('/'));
     type_text(&mut app, "walking");
@@ -201,7 +201,7 @@ fn esc_clears_the_filter_and_restores_the_full_list() {
 fn filtering_issues_no_request_at_any_keystroke() {
     let repo = FixtureRepo::with_origin(REMOTE);
     let stub = StubGithub::serving(issue_list(three_issues()));
-    let mut app = App::start(&environment(&repo.path, &stub));
+    let mut app = start(&environment(&repo.path, &stub));
 
     // The one query a cold start makes.
     assert_eq!(stub.request_count(), 1);
@@ -226,7 +226,7 @@ fn filtering_issues_no_request_at_any_keystroke() {
 fn typing_mode_makes_letters_text_rather_than_commands() {
     let repo = FixtureRepo::with_origin(REMOTE);
     let stub = StubGithub::serving(issue_list(three_issues()));
-    let mut app = App::start(&environment(&repo.path, &stub));
+    let mut app = start(&environment(&repo.path, &stub));
 
     press(&mut app, KeyCode::Char('/'));
     type_text(&mut app, "q");
@@ -251,7 +251,7 @@ fn typing_mode_makes_letters_text_rather_than_commands() {
 fn the_selection_lands_on_a_row_that_still_exists() {
     let repo = FixtureRepo::with_origin(REMOTE);
     let stub = StubGithub::serving(issue_list(three_issues()));
-    let mut app = App::start(&environment(&repo.path, &stub));
+    let mut app = start(&environment(&repo.path, &stub));
 
     // The last row of three.
     press(&mut app, KeyCode::Char('G'));
@@ -281,7 +281,7 @@ fn the_selection_lands_on_a_row_that_still_exists() {
 fn o_cycles_open_closed_all_and_queries_the_state_it_moved_to() {
     let repo = FixtureRepo::with_origin(REMOTE);
     let stub = StubGithub::serving(issue_list(three_issues()));
-    let mut app = App::start(&environment(&repo.path, &stub));
+    let mut app = start(&environment(&repo.path, &stub));
 
     // The cold start asks for open issues.
     assert_eq!(stub.request_count(), 1);
@@ -309,7 +309,7 @@ fn o_cycles_open_closed_all_and_queries_the_state_it_moved_to() {
 fn a_state_with_no_issues_says_which_state_and_how_to_leave_it() {
     let repo = FixtureRepo::with_origin(REMOTE);
     let stub = StubGithub::serving(issue_list(vec![]));
-    let mut app = App::start(&environment(&repo.path, &stub));
+    let mut app = start(&environment(&repo.path, &stub));
 
     assert!(
         screen(&app, 72, 10).contains("no open issues · [o] to include closed"),
@@ -337,7 +337,7 @@ fn a_failed_toggle_leaves_the_rows_already_on_screen() {
     let repo = FixtureRepo::with_origin(REMOTE);
     // The endpoint answers the cold start and then stops working.
     let stub = StubGithub::serving_once(issue_list(three_issues()));
-    let mut app = App::start(&environment(&repo.path, &stub));
+    let mut app = start(&environment(&repo.path, &stub));
     assert_eq!(numbers_on_screen(&screen(&app, 72, 10)), vec![7, 42, 11]);
 
     press(&mut app, KeyCode::Char('o'));

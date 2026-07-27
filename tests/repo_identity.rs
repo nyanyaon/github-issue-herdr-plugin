@@ -11,11 +11,10 @@ mod support;
 use std::fs;
 use std::path::Path;
 
-use herdr_issues::app::App;
 use herdr_issues::environment::Environment;
 use herdr_issues::identity::{Slug, SlugOverrides};
 use serde_json::json;
-use support::{FixtureRepo, StubGithub, StubHerdr, environment, screen};
+use support::{FixtureRepo, StubGithub, StubHerdr, environment, screen, start};
 
 /// A GitHub that knows no repo at all. Its status line names whatever slug it
 /// was asked for, which is how these tests read the resolution result.
@@ -67,7 +66,7 @@ fn assert_queried(screen: &str, slug: &str) {
 /// Starts a pane on this environment and returns what it drew. Wide enough that
 /// a status line naming a slug or a path is never clipped.
 fn pane(environment: &Environment) -> String {
-    screen(&App::start(environment), 120, 12)
+    screen(&start(environment), 120, 12)
 }
 
 #[test]

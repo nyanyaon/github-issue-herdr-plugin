@@ -21,6 +21,13 @@ pub enum StatusLine {
     Api(ApiError),
     /// The query succeeded and returned nothing for the state it asked for.
     Empty(IssueStates),
+    /// A cold start: nothing is cached for this repo, and the list query it was
+    /// opened with has not answered yet.
+    ///
+    /// The one line a pane with no data can honestly show. A warm start never
+    /// shows it — there the rows are already up, with their age in the header,
+    /// and SPEC §11 is explicit that nothing spins over content that exists.
+    Fetching,
     /// `config.toml` was read and something in it was ignored.
     ///
     /// The least urgent line there is — nothing is broken, and the defaults are
@@ -44,6 +51,7 @@ impl fmt::Display for StatusLine {
                 write!(f, "no closed issues · [o] to include all")
             }
             Self::Empty(IssueStates::All) => write!(f, "no issues"),
+            Self::Fetching => write!(f, "fetching issues · nothing cached for this repo yet"),
             // The file is named once, then every clause it earned.
             Self::Config(warnings) => {
                 let clauses: Vec<String> = warnings.iter().map(ToString::to_string).collect();

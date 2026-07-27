@@ -8,7 +8,7 @@ mod support;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use herdr_issues::app::App;
 use serde_json::json;
-use support::{FixtureRepo, StubGithub, environment, screen, seconds_ago};
+use support::{FixtureRepo, StubGithub, environment, screen, seconds_ago, start};
 
 /// A canned answer to the issue list query, in GitHub's response shape.
 fn issue_list(name_with_owner: &str, issues: Vec<serde_json::Value>) -> String {
@@ -78,7 +78,7 @@ fn cold_start_renders_a_row_for_each_issue() {
         "nyanyaon/github-issue-herdr-plugin",
         three_issues(),
     ));
-    let app = App::start(&environment(&repo.path, &stub));
+    let app = start(&environment(&repo.path, &stub));
 
     let screen = screen(&app, 72, 10);
 
@@ -128,7 +128,7 @@ fn a_row_with_no_comments_shows_no_count() {
         "nyanyaon/github-issue-herdr-plugin",
         three_issues(),
     ));
-    let app = App::start(&environment(&repo.path, &stub));
+    let app = start(&environment(&repo.path, &stub));
 
     let screen = screen(&app, 72, 10);
     let row = line_with(&screen, "#7");
@@ -150,7 +150,7 @@ fn the_header_names_the_repo_the_api_returned_not_the_remote() {
         "octocat/new-name",
         vec![issue(1, "Still here", &["map"], 0, 60)],
     ));
-    let app = App::start(&environment(&repo.path, &stub));
+    let app = start(&environment(&repo.path, &stub));
 
     let screen = screen(&app, 72, 10);
 
@@ -165,7 +165,7 @@ fn j_k_arrows_and_g_move_the_selection() {
         "nyanyaon/github-issue-herdr-plugin",
         three_issues(),
     ));
-    let mut app = App::start(&environment(&repo.path, &stub));
+    let mut app = start(&environment(&repo.path, &stub));
 
     assert!(selected_line(&screen(&app, 72, 10)).contains("#7"));
 
@@ -200,7 +200,7 @@ fn herdr_reserved_keys_are_never_consumed() {
         "nyanyaon/github-issue-herdr-plugin",
         three_issues(),
     ));
-    let mut app = App::start(&environment(&repo.path, &stub));
+    let mut app = start(&environment(&repo.path, &stub));
 
     for code in [KeyCode::Char('b'), KeyCode::Char('v'), KeyCode::Char('q')] {
         app.handle_key(KeyEvent::new(code, KeyModifiers::CONTROL));
@@ -228,7 +228,7 @@ fn a_narrow_pane_clips_the_title_and_keeps_the_row_readable() {
         "nyanyaon/github-issue-herdr-plugin",
         three_issues(),
     ));
-    let app = App::start(&environment(&repo.path, &stub));
+    let app = start(&environment(&repo.path, &stub));
 
     let wide = screen(&app, 100, 10);
     assert!(
@@ -255,7 +255,7 @@ fn a_narrow_pane_clips_the_title_and_keeps_the_row_readable() {
 fn a_repo_with_no_open_issues_says_so() {
     let repo = FixtureRepo::with_origin("https://github.com/nyanyaon/github-issue-herdr-plugin");
     let stub = StubGithub::serving(issue_list("nyanyaon/github-issue-herdr-plugin", vec![]));
-    let app = App::start(&environment(&repo.path, &stub));
+    let app = start(&environment(&repo.path, &stub));
 
     let screen = screen(&app, 72, 10);
     assert!(
@@ -272,7 +272,7 @@ fn a_repo_with_no_open_issues_says_so() {
 fn a_workspace_with_no_git_repo_says_so() {
     let workspace = FixtureRepo::not_a_repo();
     let stub = StubGithub::serving(issue_list("nyanyaon/never-asked", vec![]));
-    let app = App::start(&environment(&workspace, &stub));
+    let app = start(&environment(&workspace, &stub));
 
     let screen = screen(&app, 72, 10);
     assert!(screen.contains("no git repo in this workspace"), "{screen}");
@@ -286,7 +286,7 @@ fn a_workspace_with_no_git_repo_says_so() {
 fn a_remote_on_another_host_is_named_as_unsupported() {
     let repo = FixtureRepo::with_origin("git@gitlab.com:nyanyaon/thing.git");
     let stub = StubGithub::serving(issue_list("nyanyaon/never-asked", vec![]));
-    let app = App::start(&environment(&repo.path, &stub));
+    let app = start(&environment(&repo.path, &stub));
 
     let screen = screen(&app, 72, 10);
     assert!(
@@ -299,7 +299,7 @@ fn a_remote_on_another_host_is_named_as_unsupported() {
 fn a_rejected_token_says_so_rather_than_that_the_repo_is_missing() {
     let repo = FixtureRepo::with_origin("https://github.com/nyanyaon/github-issue-herdr-plugin");
     let stub = StubGithub::responding(401, r#"{"message":"Bad credentials"}"#);
-    let app = App::start(&environment(&repo.path, &stub));
+    let app = start(&environment(&repo.path, &stub));
 
     let screen = screen(&app, 72, 10);
     assert!(screen.contains("token rejected"), "{screen}");
@@ -315,7 +315,7 @@ fn a_repo_the_token_cannot_see_is_reported_as_not_found() {
         })
         .to_string(),
     );
-    let app = App::start(&environment(&repo.path, &stub));
+    let app = start(&environment(&repo.path, &stub));
 
     let screen = screen(&app, 72, 10);
     assert!(
@@ -330,7 +330,7 @@ fn with_no_token_the_pane_says_where_to_get_one() {
     let stub = StubGithub::serving(issue_list("nyanyaon/never-asked", vec![]));
     let mut environment = environment(&repo.path, &stub);
     environment.token = None;
-    let app = App::start(&environment);
+    let app = start(&environment);
 
     let screen = screen(&app, 72, 10);
     assert!(screen.contains("no GitHub token found"), "{screen}");

@@ -26,6 +26,24 @@ pub fn parse_timestamp(text: &str) -> Option<i64> {
     Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
 }
 
+/// The inverse of [`parse_timestamp`]: unix seconds back to the RFC 3339 form
+/// GitHub sent.
+///
+/// The cache stores `updatedAt` as the text its schema asks for, so a database
+/// opened by hand reads as timestamps rather than as epoch integers, and the
+/// staleness comparison built on that column compares the same strings GitHub
+/// does.
+pub fn format_timestamp(unix_seconds: i64) -> String {
+    let (year, month, day) = civil_from_days(unix_seconds.div_euclid(86_400));
+    let seconds = unix_seconds.rem_euclid(86_400);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        seconds / 3_600,
+        (seconds % 3_600) / 60,
+        seconds % 60
+    )
+}
+
 /// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
 /// `days_from_civil`).
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
@@ -36,6 +54,25 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     era * 146_097 + day_of_era - 719_468
+}
+
+/// The inverse of [`days_from_civil`], for [`format_timestamp`].
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 /// A compact age for a list row: `now`, `18m`, `4h`, `12d`.
@@ -75,6 +112,19 @@ mod tests {
         assert_eq!(parse_timestamp("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_timestamp("2026-07-27T09:14:03Z"), Some(1_785_143_643));
         assert_eq!(parse_timestamp("not a timestamp"), None);
+    }
+
+    #[test]
+    fn a_timestamp_round_trips_through_the_text_the_cache_stores() {
+        for text in [
+            "1970-01-01T00:00:00Z",
+            "2026-07-27T09:14:03Z",
+            "2024-02-29T23:59:59Z",
+            "2000-03-01T00:00:00Z",
+        ] {
+            let seconds = parse_timestamp(text).expect("a timestamp this test wrote");
+            assert_eq!(format_timestamp(seconds), text);
+        }
     }
 
     #[test]

@@ -23,11 +23,20 @@ fn main() -> io::Result<()> {
 
 /// The event loop. Between renders the process blocks in `event::read`: no
 /// timer, no polling thread, no held subscription.
+///
+/// The one thing it does before blocking is the startup list query, and it does
+/// it *after* a draw. That is where cache-first rendering actually happens: the
+/// frame above is the cached one, drawn with nothing asked of the network, and
+/// the query below replaces it.
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
     loop {
         terminal.draw(|frame| app.render(frame))?;
         if app.should_exit() {
             return Ok(());
+        }
+        if app.has_pending_query() {
+            app.run_pending_query();
+            continue;
         }
         match event::read()? {
             Event::Key(key) => app.handle_key(key),

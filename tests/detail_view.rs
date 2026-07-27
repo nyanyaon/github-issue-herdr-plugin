@@ -9,7 +9,7 @@ mod support;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use herdr_issues::app::App;
 use serde_json::{Value, json};
-use support::{FixtureRepo, StubGithub, environment, screen, seconds_ago};
+use support::{FixtureRepo, StubGithub, environment, screen, seconds_ago, start};
 
 const REMOTE: &str = "https://github.com/nyanyaon/github-issue-herdr-plugin";
 const SLUG: &str = "nyanyaon/github-issue-herdr-plugin";
@@ -95,7 +95,7 @@ fn app_showing(body: &str) -> (FixtureRepo, StubGithub, App) {
         issue_list(vec![row(8, "Packaging and distribution")]),
         vec![(8, detail(8, "Packaging and distribution", body, vec![]))],
     );
-    let mut app = App::start(&environment(&repo.path, &stub));
+    let mut app = start(&environment(&repo.path, &stub));
     press(&mut app, KeyCode::Enter);
     (repo, stub, app)
 }
@@ -138,7 +138,7 @@ fn enter_opens_the_detail_view_and_esc_returns_with_the_selection_intact() {
             detail(42, "Walking skeleton", "The pane, end to end.", vec![]),
         )],
     );
-    let mut app = App::start(&environment(&repo.path, &stub));
+    let mut app = start(&environment(&repo.path, &stub));
 
     press(&mut app, KeyCode::Char('j'));
     press(&mut app, KeyCode::Enter);
@@ -181,7 +181,7 @@ fn n_and_p_walk_the_list_order_without_returning_to_the_list() {
             ),
         ],
     );
-    let mut app = App::start(&environment(&repo.path, &stub));
+    let mut app = start(&environment(&repo.path, &stub));
     press(&mut app, KeyCode::Enter);
     assert!(screen(&app, 72, 12).contains("‹ #7 Pane UI shape"));
 
@@ -231,7 +231,7 @@ fn the_header_carries_number_title_state_label_author_age_and_comment_count() {
             ),
         )],
     );
-    let mut app = App::start(&environment(&repo.path, &stub));
+    let mut app = start(&environment(&repo.path, &stub));
     press(&mut app, KeyCode::Enter);
 
     let screen = screen(&app, 72, 14);
@@ -264,7 +264,7 @@ fn comments_render_in_order_behind_an_author_and_timestamp_rule() {
             ),
         )],
     );
-    let mut app = App::start(&environment(&repo.path, &stub));
+    let mut app = start(&environment(&repo.path, &stub));
     press(&mut app, KeyCode::Enter);
 
     let screen = screen(&app, 72, 16);
@@ -455,7 +455,7 @@ fn a_failed_detail_fetch_leaves_the_list_on_screen() {
             .to_string(),
         )],
     );
-    let mut app = App::start(&environment(&repo.path, &stub));
+    let mut app = start(&environment(&repo.path, &stub));
 
     press(&mut app, KeyCode::Enter);
 
@@ -511,7 +511,7 @@ fn enter_under_a_filter_opens_the_row_the_cursor_is_on() {
             ),
         ],
     );
-    let mut app = App::start(&environment(&repo.path, &stub));
+    let mut app = start(&environment(&repo.path, &stub));
 
     press(&mut app, KeyCode::Char('/'));
     for character in "wskel".chars() {
@@ -556,7 +556,7 @@ fn n_walks_the_filtered_order_rather_than_the_fetched_one() {
             (11, detail(11, "Skeleton key", "Second.", vec![])),
         ],
     );
-    let mut app = App::start(&environment(&repo.path, &stub));
+    let mut app = start(&environment(&repo.path, &stub));
 
     press(&mut app, KeyCode::Char('/'));
     for character in "skel".chars() {
