@@ -33,7 +33,8 @@ const FIRST_COMMENT_PAGE: i64 = 1;
 /// The schema, exactly as SPEC §9 states it.
 const SCHEMA_V1: &str = "
 CREATE TABLE repo (
-  slug TEXT PRIMARY KEY,            -- nameWithOwner as returned by the API
+  slug TEXT PRIMARY KEY,            -- the resolved identity slug, not nameWithOwner:
+                                    -- it is the only key available before the fetch
   fetched_at INTEGER NOT NULL,      -- unix seconds, last successful list query
   opened_at  INTEGER NOT NULL,      -- last time a pane displayed this repo
   open_count INTEGER
