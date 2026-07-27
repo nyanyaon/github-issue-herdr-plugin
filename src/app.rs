@@ -209,9 +209,18 @@ impl App {
     /// It goes false once, at the end of startup, and only a keystroke can make
     /// it true again. That is the whole of "no work while idle".
     pub fn has_pending_query(&self) -> bool {
-        self.pending_list_query
-            || self.pending_detail_fetch.is_some()
-            || self.pending_prune.is_some()
+        self.has_pending_request() || self.pending_prune.is_some()
+    }
+
+    /// The subset of the above that would touch the **network**.
+    ///
+    /// Worth its own name: since the startup prune joined the queue,
+    /// [`App::has_pending_query`] answers "is any work owed", which is what the
+    /// event loop needs but not what "did that failure queue a retry" asks. A
+    /// test reaching for the broader one would see the prune and read it as a
+    /// retry that never existed.
+    pub fn has_pending_request(&self) -> bool {
+        self.pending_list_query || self.pending_detail_fetch.is_some()
     }
 
     /// Runs whichever piece of work the last frame was drawn ahead of — SPEC §5
