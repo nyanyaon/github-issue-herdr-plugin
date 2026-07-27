@@ -79,10 +79,15 @@ detect_target() {
 # One file, over TLS, failing on any HTTP error status. Redirects are followed
 # because GitHub Releases serve assets from a separate download host.
 #
-# `--proto '=https'` pins the scheme for real installs; it is dropped only when
-# the test hook points somewhere that is not https, and verification of the
-# downloaded bytes is unchanged either way. Nothing here ever disables TLS
-# verification.
+# `--proto '=https'` pins the scheme for real installs, and `--proto-redir` pins
+# it again *across redirects* — without it a downgrade to http would be followed
+# silently. That matters more than it looks: `checksums.txt` travels this same
+# path, so an attacker who can rewrite the transport can serve both a tampered
+# archive and a checksum that matches it, and the verification below would agree
+# with them. TLS integrity is what keeps the checksum meaningful.
+#
+# Both are dropped only when the test hook points somewhere that is not https.
+# Nothing here ever disables TLS verification.
 download() {
 	url="$1"
 	output="$2"
@@ -90,7 +95,7 @@ download() {
 		case "${url}" in
 		https://*)
 			curl --fail --silent --show-error --location \
-				--proto '=https' --tlsv1.2 \
+				--proto '=https' --proto-redir '=https' --tlsv1.2 \
 				--connect-timeout 10 --max-time 300 \
 				--output "${output}" -- "${url}"
 			;;
@@ -101,7 +106,15 @@ download() {
 			;;
 		esac
 	elif command -v wget >/dev/null 2>&1; then
-		wget --quiet --timeout=10 --output-document="${output}" -- "${url}"
+		case "${url}" in
+		https://*)
+			wget --quiet --https-only --secure-protocol=TLSv1_2 \
+				--timeout=10 --output-document="${output}" -- "${url}"
+			;;
+		*)
+			wget --quiet --timeout=10 --output-document="${output}" -- "${url}"
+			;;
+		esac
 	else
 		log "neither curl nor wget is available"
 		return 1
