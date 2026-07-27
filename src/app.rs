@@ -41,7 +41,7 @@ impl App {
             exit: false,
         };
 
-        let identity = match crate::identity::resolve(&environment.workspace_cwd) {
+        let identity = match crate::identity::resolve(environment) {
             Ok(identity) => identity,
             Err(error) => {
                 app.status = Some(StatusLine::Identity(error));
