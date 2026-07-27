@@ -1,0 +1,131 @@
+name: release
+
+# A tagged push is the whole release process. Nothing else publishes.
+#
+# Without a published artifact for a platform, every install there silently
+# becomes a multi-minute source build — `scripts/fetch-or-build.sh` falls back
+# rather than failing, so a missing or misnamed release is invisible until
+# someone times an install. That is why this workflow is a product surface and
+# why the version gate below runs before anything is built.
+on:
+  push:
+    tags:
+      - "v*"
+
+# Only the release job writes, and only to this repo's releases.
+permissions:
+  contents: read
+
+env:
+  BINARY: herdr-issues
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Runs first and gates everything else: the install script keys the download
+  # URL off the manifest `version`, so a tag that disagrees with it would publish
+  # artifacts no installer ever asks for (ADR-0003).
+  check-version:
+    name: tag agrees with the manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare the tag with herdr-plugin.toml and Cargo.toml
+        run: ./scripts/check-release-version.sh "${GITHUB_REF_NAME}"
+
+  # The four targets ADR-0003 declares, and no fifth. musl gives one static
+  # binary per Linux arch, indifferent to the distro's glibc; `rustls` and
+  # bundled SQLite are what make that painless. Both arches build natively, so
+  # bundled SQLite never needs a cross C toolchain.
+  build:
+    name: ${{ matrix.target }}
+    needs: check-version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the musl C toolchain
+        if: endsWith(matrix.target, '-linux-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+
+      - name: Add the Rust target
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Build
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      # A flat archive holding exactly `herdr-issues` — the install script
+      # unpacks it and expects that name at the top level, with no directory.
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          archive="${BINARY}-${{ matrix.target }}.tar.gz"
+          tar -czf "${archive}" -C "target/${{ matrix.target }}/release" "${BINARY}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${archive}" > "${archive}.sha256"
+          else
+            shasum -a 256 "${archive}" > "${archive}.sha256"
+          fi
+          cat "${archive}.sha256"
+          echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  # One release, created only once every target has built. `checksums.txt` is
+  # what `scripts/fetch-or-build.sh` verifies against, so it is as much a release
+  # asset as the binaries.
+  release:
+    name: publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Collect the checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          cat ./*.tar.gz.sha256 | sort -k 2 > checksums.txt
+          rm -f ./*.tar.gz.sha256
+          # Re-verify here rather than trusting the per-target job: this is the
+          # exact file installers will check downloads against.
+          sha256sum --check checksums.txt
+          ls -l
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            artifacts/*.tar.gz \
+            artifacts/checksums.txt
