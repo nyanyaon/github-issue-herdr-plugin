@@ -113,7 +113,11 @@ impl Environment {
                 .ok()
                 .filter(|url| !url.is_empty())
                 .unwrap_or_else(|| DEFAULT_GRAPHQL_URL.to_string()),
-            token: discover_token(),
+            token: resolve_token(
+                env::var("GITHUB_TOKEN").ok(),
+                env::var("GH_TOKEN").ok(),
+                gh_auth_token,
+            ),
             // Everything the config file decides keeps its default until the
             // file is folded in below.
             ..Self::default()
@@ -124,7 +128,7 @@ impl Environment {
     /// Folds a loaded `config.toml` in, which is the last thing startup learns
     /// from outside itself.
     ///
-    /// It is applied *after* [`discover_token`] has run, because that is where
+    /// It is applied *after* [`resolve_token`] has run, because that is where
     /// `token_file` sits in ADR-0005's order — `$GITHUB_TOKEN`, `$GH_TOKEN`,
     /// `gh auth token`, then the file — so the file only ever supplies a token
     /// nothing above it did. The path is read, never written: the viewer holds
@@ -171,27 +175,48 @@ fn non_empty_var(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-/// The first three legs of ADR-0005's order: `$GITHUB_TOKEN`, then `$GH_TOKEN`,
-/// then `gh auth token`.
+/// The first three legs of ADR-0005's order, over sources the caller supplies:
+/// `$GITHUB_TOKEN`, then `$GH_TOKEN`, then `gh auth token`.
 ///
 /// The fourth, `token_file`, needs the config file and so lives in
 /// [`Environment::with_config`], which runs after this. The viewer never writes
 /// a credential of its own.
-fn discover_token() -> Option<String> {
-    for variable in ["GITHUB_TOKEN", "GH_TOKEN"] {
-        if let Ok(token) = env::var(variable) {
-            let token = token.trim().to_string();
-            if !token.is_empty() {
-                return Some(token);
-            }
-        }
-    }
+///
+/// The two variables arrive as values and `gh` as a closure, which is what makes
+/// the order both lazy and testable: `gh` is spawned only if the order actually
+/// reaches it, and a test can supply a stand-in and watch whether it was reached
+/// at all. Reading the process environment here instead would make the order
+/// untestable — setting a variable in a test is `unsafe` in edition 2024 and
+/// races every other test in the binary.
+///
+/// A variable that is set but blank or whitespace is not a token, and the order
+/// carries on past it.
+pub fn resolve_token(
+    github_token: Option<String>,
+    gh_token: Option<String>,
+    gh_auth_token: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let supplied = |value: Option<String>| {
+        value
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+    };
+    supplied(github_token)
+        .or_else(|| supplied(gh_token))
+        .or_else(|| supplied(gh_auth_token()))
+}
+
+/// `gh auth token`, the third leg — one spawn, ~40 ms, and only when neither
+/// variable answered.
+///
+/// It is the whole reason a `gh` user configures nothing: `gh` already resolves
+/// `GH_TOKEN`, `hosts.yml` or the system keyring, whichever that install uses.
+fn gh_auth_token() -> Option<String> {
     let output = Command::new("gh").args(["auth", "token"]).output().ok()?;
     if !output.status.success() {
         return None;
     }
-    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!token.is_empty()).then_some(token)
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// The token in `token_file`: **the first line, trimmed**, so a file with a
