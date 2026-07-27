@@ -170,7 +170,7 @@ impl App {
 
     /// The rows the filter lets through, in list order.
     ///
-    /// Cheap enough to recompute per render — fifty rows and a substring test —
+    /// Cheap enough to recompute per render — fifty rows and a subsequence test —
     /// so there is no second copy of the list to keep in step with the first.
     pub fn visible_rows(&self) -> Vec<&IssueRow> {
         let Some(list) = self.issue_list.as_ref() else {

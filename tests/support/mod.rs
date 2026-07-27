@@ -10,9 +10,6 @@
 //! the part of it that its subject needs, so unused items here are expected.
 #![allow(dead_code)]
 
-// Every test binary compiles the whole harness, and no single one uses all of it.
-#![allow(dead_code)]
-
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
