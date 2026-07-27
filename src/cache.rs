@@ -31,6 +31,73 @@ pub const FILE_NAME: &str = "cache.sqlite3";
 /// long thread can be resumed from its cursor.
 const FIRST_COMMENT_PAGE: i64 = 1;
 
+/// Seconds in a day, which is the unit both prune ages are configured in.
+const SECONDS_PER_DAY: i64 = 86_400;
+
+/// How old a row may get before the startup prune takes it, and how big the
+/// file may get before compaction is worth its cost.
+///
+/// The two ages come from `config.toml` (SPEC §10); the threshold is fixed,
+/// because it is a property of what a `VACUUM` costs rather than something a
+/// user has an opinion about. It is a field rather than a constant only so that
+/// a test can put a database above the threshold without writing 64 MB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrunePolicy {
+    /// `prune_details_after_days` — how long a detail survives untouched.
+    pub details_after_days: u32,
+    /// `prune_repos_after_days` — how long a repo survives unopened.
+    pub repos_after_days: u32,
+    /// The size past which a prune that freed pages is followed by a `VACUUM`.
+    pub compact_above_bytes: u64,
+}
+
+impl PrunePolicy {
+    /// SPEC §9: `VACUUM` only when the file exceeds ~64 MB.
+    ///
+    /// A `VACUUM` rewrites the whole database, so on the startup path it is
+    /// only worth doing when there is a real amount of space to win back. Below
+    /// this the freed pages are simply reused by the next write, which is what
+    /// SQLite's freelist is for.
+    pub const COMPACT_ABOVE_BYTES: u64 = 64 * 1024 * 1024;
+
+    /// The policy for the configured ages, with the standard threshold.
+    pub fn after_days(details_after_days: u32, repos_after_days: u32) -> Self {
+        Self {
+            details_after_days,
+            repos_after_days,
+            compact_above_bytes: Self::COMPACT_ABOVE_BYTES,
+        }
+    }
+}
+
+/// What one startup prune took, and whether it compacted afterwards.
+///
+/// Nothing renders this — the prune is silent, like every other thing the cache
+/// does — but it is what the compaction threshold is decided from, and what the
+/// tests assert "and nothing else" against.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Pruned {
+    /// `repo` rows dropped for being unopened past their age.
+    pub repos: usize,
+    /// `issue_list` rows dropped, all of them belonging to a dropped repo:
+    /// **the detail prune never touches the list**.
+    pub list_rows: usize,
+    /// `issue_detail` rows dropped, by either rule.
+    pub details: usize,
+    /// `issue_comments` pages dropped, always with the detail they belonged to.
+    pub comment_pages: usize,
+    /// Whether the file was over the threshold and got compacted.
+    pub compacted: bool,
+}
+
+impl Pruned {
+    /// Did this prune free anything at all? A prune that deleted nothing has
+    /// left no free pages behind, so there is nothing for a `VACUUM` to win.
+    pub fn is_empty(&self) -> bool {
+        self.repos == 0 && self.list_rows == 0 && self.details == 0 && self.comment_pages == 0
+    }
+}
+
 /// The schema, exactly as SPEC §9 states it.
 const SCHEMA_V1: &str = "
 CREATE TABLE repo (
@@ -165,6 +232,108 @@ impl Cache {
              WHERE slug = ?1",
             params![slug.to_string(), age::now()],
         );
+    }
+
+    /// The startup prune (SPEC §9), and the compaction that occasionally
+    /// follows it.
+    ///
+    /// Two rules, and **nothing else**:
+    ///
+    /// - a repo nothing has opened for `repos_after_days` loses every row it
+    ///   has, in all four tables;
+    /// - a detail nothing has displayed for `details_after_days` loses its body
+    ///   and its comment pages — **and not its list row**, which is a row of the
+    ///   repo's list rather than of the detail, costs a few dozen bytes, and is
+    ///   what makes the pane's next frame instant.
+    ///
+    /// Both ages are read off columns GitHub had no part in: `repo.opened_at`
+    /// and `issue_detail.touched_at` are written when a pane displays the thing
+    /// they belong to. This is the one place in the viewer where a clock decides
+    /// anything, and it decides only what to *forget* — never what is
+    /// **stale**, which stays a disagreement between two `updatedAt`s.
+    ///
+    /// One transaction, so another pane reads the database either before this
+    /// prune or after it. `IMMEDIATE`, so two panes pruning at once serialise on
+    /// the write lock rather than one of them failing to upgrade halfway
+    /// through.
+    ///
+    /// Silent on failure, like everything else here: a prune that could not run
+    /// leaves a slightly larger cache and nothing worse.
+    pub fn prune(&self, policy: PrunePolicy) -> Pruned {
+        let mut pruned = self.delete_aged_rows(policy).unwrap_or_default();
+        if !pruned.is_empty() {
+            pruned.compacted = self
+                .compact_above(policy.compact_above_bytes)
+                .unwrap_or(false);
+        }
+        pruned
+    }
+
+    fn delete_aged_rows(&self, policy: PrunePolicy) -> rusqlite::Result<Pruned> {
+        let now = age::now();
+        let repos_before = now - days(policy.repos_after_days);
+        let details_before = now - days(policy.details_after_days);
+        let mut pruned = Pruned::default();
+
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+
+        // Every row of a repo nothing has opened in long enough. The child rows
+        // go first, so that a failure anywhere cannot leave a `repo` row without
+        // its list — though the transaction would have rolled that back anyway.
+        const OF_A_STALE_REPO: &str = "slug IN (SELECT slug FROM repo WHERE opened_at < ?1)";
+        for (table, counter) in [
+            ("issue_comments", &mut pruned.comment_pages),
+            ("issue_detail", &mut pruned.details),
+            ("issue_list", &mut pruned.list_rows),
+        ] {
+            *counter = transaction.execute(
+                &format!("DELETE FROM {table} WHERE {OF_A_STALE_REPO}"),
+                params![repos_before],
+            )?;
+        }
+        pruned.repos = transaction.execute(
+            "DELETE FROM repo WHERE opened_at < ?1",
+            params![repos_before],
+        )?;
+
+        // Then the details of repos that are staying: the pages first, while
+        // the rows naming them are still there to be joined against.
+        pruned.comment_pages += transaction.execute(
+            "DELETE FROM issue_comments
+             WHERE EXISTS (SELECT 1 FROM issue_detail d
+                           WHERE d.slug = issue_comments.slug
+                             AND d.number = issue_comments.number
+                             AND d.touched_at < ?1)",
+            params![details_before],
+        )?;
+        pruned.details += transaction.execute(
+            "DELETE FROM issue_detail WHERE touched_at < ?1",
+            params![details_before],
+        )?;
+
+        transaction.commit()?;
+        Ok(pruned)
+    }
+
+    /// `VACUUM`, but only when the database is bigger than `threshold`.
+    ///
+    /// The size is the main database file's — `page_count * page_size` — which
+    /// is exactly the thing a `VACUUM` would shrink. Deleting rows does not
+    /// shrink it: the pages go on the freelist, and stay part of the file until
+    /// something rewrites it or reuses them.
+    fn compact_above(&self, threshold: u64) -> rusqlite::Result<bool> {
+        let pages: i64 = self
+            .connection
+            .query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let page_size: i64 = self
+            .connection
+            .query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        if pages.saturating_mul(page_size).max(0) as u64 <= threshold {
+            return Ok(false);
+        }
+        self.connection.execute_batch("VACUUM")?;
+        Ok(true)
     }
 
     fn read_issue_list(
@@ -381,6 +550,12 @@ impl Cache {
         )?;
         transaction.commit()
     }
+}
+
+/// A configured age in the unix seconds the columns it is compared against are
+/// kept in.
+fn days(count: u32) -> i64 {
+    i64::from(count) * SECONDS_PER_DAY
 }
 
 /// The `state` column a set of states matches, or `NULL` for all of them.
@@ -687,6 +862,185 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// Dates a repo and one of its details back, the way a database left alone
+    /// for months would be. Both columns are written by the viewer, so this is
+    /// the only way to make an old one.
+    fn age_rows(cache: &Cache, slug: &Slug, repo_days: i64, detail_days: i64) {
+        let then = |days: i64| age::now() - days * SECONDS_PER_DAY;
+        cache
+            .connection
+            .execute(
+                "UPDATE repo SET opened_at = ?2 WHERE slug = ?1",
+                params![slug.to_string(), then(repo_days)],
+            )
+            .expect("date the repo back");
+        cache
+            .connection
+            .execute(
+                "UPDATE issue_detail SET touched_at = ?2 WHERE slug = ?1",
+                params![slug.to_string(), then(detail_days)],
+            )
+            .expect("date the detail back");
+    }
+
+    fn count(cache: &Cache, table: &str, slug: &Slug) -> i64 {
+        cache
+            .connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE slug = ?1"),
+                params![slug.to_string()],
+                |row| row.get(0),
+            )
+            .expect("count the rows")
+    }
+
+    /// The prune's first rule, and the half of it that is easy to get wrong: a
+    /// detail nothing has displayed for long enough loses its body and its
+    /// comment pages — **and nothing else**. Its list row stays, because the row
+    /// belongs to the repo's list rather than to the detail, and it is what the
+    /// next pane draws its first frame from.
+    #[test]
+    fn an_aged_detail_takes_its_comment_pages_and_leaves_its_list_row() {
+        let cache = Cache::open_at(&temp_database("aged-detail")).expect("open the cache");
+        cache.save_issue_list(&slug(), &list_with_one_row());
+        cache.save_issue_detail(&slug(), &detail_with_comments());
+        age_rows(&cache, &slug(), 1, 31);
+
+        let pruned = cache.prune(PrunePolicy::after_days(30, 90));
+
+        assert_eq!(pruned.details, 1);
+        assert_eq!(pruned.comment_pages, 1);
+        assert_eq!(pruned.repos, 0, "the repo was opened yesterday");
+        assert_eq!(pruned.list_rows, 0, "the list is not the detail's to take");
+        assert_eq!(count(&cache, "issue_detail", &slug()), 0);
+        assert_eq!(count(&cache, "issue_comments", &slug()), 0);
+        assert_eq!(count(&cache, "issue_list", &slug()), 1);
+        assert_eq!(count(&cache, "repo", &slug()), 1);
+        assert_eq!(
+            cache
+                .issue_list(&slug(), IssueStates::Open)
+                .expect("the rows a warm start draws")
+                .rows
+                .len(),
+            1
+        );
+    }
+
+    /// The other side of the same rule: a detail read the day before yesterday
+    /// is not old, and a prune that deleted it would be deleting the thing the
+    /// cache exists for.
+    #[test]
+    fn a_detail_inside_its_age_is_left_alone() {
+        let cache = Cache::open_at(&temp_database("fresh-detail")).expect("open the cache");
+        cache.save_issue_list(&slug(), &list_with_one_row());
+        cache.save_issue_detail(&slug(), &detail_with_comments());
+        age_rows(&cache, &slug(), 1, 29);
+
+        let pruned = cache.prune(PrunePolicy::after_days(30, 90));
+
+        assert_eq!(pruned, Pruned::default(), "a prune with nothing to take");
+        assert!(pruned.is_empty());
+        assert_eq!(
+            cache
+                .issue_detail(&slug(), 7)
+                .expect("the detail survived")
+                .comments
+                .len(),
+            1,
+            "and so did its comment page"
+        );
+    }
+
+    /// The prune's second rule spans every table: a repo nothing has opened in
+    /// long enough leaves nothing behind — and takes nothing of another repo
+    /// with it.
+    #[test]
+    fn an_unopened_repo_loses_every_row_it_has_and_only_its_own() {
+        let cache = Cache::open_at(&temp_database("aged-repo")).expect("open the cache");
+        let abandoned = Slug::parse("octocat/abandoned").expect("a slug this test wrote");
+        for repo in [&slug(), &abandoned] {
+            cache.save_issue_list(repo, &list_with_one_row());
+            cache.save_issue_detail(repo, &detail_with_comments());
+        }
+        // Unopened for a hundred days, but read only yesterday: the repo rule
+        // takes it anyway, detail age and all.
+        age_rows(&cache, &abandoned, 100, 1);
+        age_rows(&cache, &slug(), 1, 1);
+
+        let pruned = cache.prune(PrunePolicy::after_days(30, 90));
+
+        assert_eq!(pruned.repos, 1);
+        assert_eq!(pruned.list_rows, 1);
+        assert_eq!(pruned.details, 1);
+        assert_eq!(pruned.comment_pages, 1);
+        for table in ["repo", "issue_list", "issue_detail", "issue_comments"] {
+            assert_eq!(count(&cache, table, &abandoned), 0, "{table} kept a row");
+            assert_eq!(count(&cache, table, &slug()), 1, "{table} lost a row");
+        }
+        assert!(
+            cache.issue_list(&abandoned, IssueStates::Open).is_none(),
+            "the abandoned repo is a cold start again"
+        );
+        assert!(cache.issue_detail(&slug(), 7).is_some());
+    }
+
+    /// A prune that took nothing left no free pages behind, so there is nothing
+    /// to compact however big the file is.
+    #[test]
+    fn a_prune_that_deletes_nothing_never_compacts() {
+        let cache = Cache::open_at(&temp_database("no-compaction")).expect("open the cache");
+        cache.save_issue_list(&slug(), &list_with_one_row());
+
+        let pruned = cache.prune(PrunePolicy {
+            compact_above_bytes: 0,
+            ..PrunePolicy::after_days(30, 90)
+        });
+
+        assert!(pruned.is_empty());
+        assert!(!pruned.compacted);
+    }
+
+    /// Compaction is the size threshold's call, not the launch's (SPEC §9).
+    ///
+    /// A test database is a few pages, so the standard 64 MB threshold is the
+    /// realistic case — every launch, for years — and it must not `VACUUM`. The
+    /// threshold is then dropped to prove the other branch really is there, and
+    /// that it is a `VACUUM`: the freelist the deletes left behind is gone
+    /// afterwards.
+    #[test]
+    fn compaction_waits_for_the_size_threshold_rather_than_the_launch() {
+        let path = temp_database("compaction");
+        let seed = |cache: &Cache| {
+            cache.save_issue_list(&slug(), &list_with_one_row());
+            cache.save_issue_detail(&slug(), &detail_with_comments());
+            age_rows(cache, &slug(), 1, 31);
+        };
+
+        let cache = Cache::open_at(&path).expect("open the cache");
+        seed(&cache);
+        let pruned = cache.prune(PrunePolicy::after_days(30, 90));
+        assert!(!pruned.is_empty(), "there was something to delete");
+        assert!(
+            !pruned.compacted,
+            "a few kilobytes is not worth rewriting the file for"
+        );
+
+        seed(&cache);
+        let freelist = |cache: &Cache| -> i64 {
+            cache
+                .connection
+                .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+                .expect("read the freelist")
+        };
+        let pruned = cache.prune(PrunePolicy {
+            compact_above_bytes: 0,
+            ..PrunePolicy::after_days(30, 90)
+        });
+
+        assert!(pruned.compacted, "past the threshold it does compact");
+        assert_eq!(freelist(&cache), 0, "the freed pages left the file");
     }
 
     /// The cache holds what the last query answered, so a pane opening on `open`
