@@ -29,6 +29,49 @@ query($owner:String!,$name:String!,$states:[IssueState!],$first:Int!,$after:Stri
   }
 }";
 
+/// Which issues the list query asks for — the `$states` argument, and the only
+/// thing `o` changes.
+///
+/// The viewer holds one of these for the pane's lifetime; cycling it is the only
+/// reason the list is queried a second time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IssueStates {
+    #[default]
+    Open,
+    Closed,
+    All,
+}
+
+impl IssueStates {
+    /// The cycle `o` walks: open → closed → all → open.
+    pub fn cycled(self) -> Self {
+        match self {
+            Self::Open => Self::Closed,
+            Self::Closed => Self::All,
+            Self::All => Self::Open,
+        }
+    }
+
+    /// The word the header counts in: `6 open`, `6 closed`, `6 issues`.
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::All => "issues",
+        }
+    }
+
+    /// The `$states` variable. `All` sends null, which is how GraphQL says
+    /// "every state" — there is no `ALL` member of `IssueState`.
+    fn argument(self) -> serde_json::Value {
+        match self {
+            Self::Open => json!(["OPEN"]),
+            Self::Closed => json!(["CLOSED"]),
+            Self::All => serde_json::Value::Null,
+        }
+    }
+}
+
 /// One row of the issue list.
 #[derive(Debug, Clone)]
 pub struct IssueRow {
@@ -120,14 +163,20 @@ impl GithubClient {
         }
     }
 
-    /// The one query this slice makes: open issues, most recently updated first.
-    pub fn issue_list(&self, slug: &Slug, page_size: u32) -> Result<IssueList, ApiError> {
+    /// The one query this slice makes: the issues in `states`, most recently
+    /// updated first.
+    pub fn issue_list(
+        &self,
+        slug: &Slug,
+        states: IssueStates,
+        page_size: u32,
+    ) -> Result<IssueList, ApiError> {
         let body = json!({
             "query": ISSUE_LIST_QUERY,
             "variables": {
                 "owner": slug.owner,
                 "name": slug.name,
-                "states": ["OPEN"],
+                "states": states.argument(),
                 "first": page_size,
                 "after": serde_json::Value::Null,
             }
