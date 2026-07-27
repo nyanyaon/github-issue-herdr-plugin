@@ -21,6 +21,11 @@ signal-hook = "0.4"
 # `config.toml`. Parsed as a plain table rather than derived onto a struct, so
 # an unknown key can warn and be ignored instead of failing the whole file.
 toml = "1"
+# The cache. `bundled` compiles SQLite from C, which is exactly why prebuilt
+# binaries are not optional (ADR-0001, ADR-0003) — an installing user gets
+# neither a C compiler nor a runtime `libsqlite3` requirement from us. Pinned to
+# 0.37 because 0.40's build script needs a newer rustc than this toolchain has.
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 [dev-dependencies]
 # The stub GraphQL server gzips its responses, which is how the tests exercise
