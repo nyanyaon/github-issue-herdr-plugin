@@ -88,6 +88,8 @@ No tokio, no OpenSSL, no `octocrab`, no `graphql_client` codegen. Queries are ha
 5. Resolve the token (§7). On failure, render the no-token state; cached rows still display.
 6. Render immediately from cache if present, then run the list query and re-render.
 
+The ordering in step 6 is the point, not an optimisation: the cached frame is drawn **before** the list query goes out, never after it returns. A warm start still queries — `r` is the only way to ask for fresh data, so a start that skipped the query would strand a pane on whatever it last cached.
+
 Signals: `SIGWINCH` → recompute layout and re-wrap. `SIGHUP` → flush, leave the alternate screen, exit 0. Exiting removes the pane; no teardown call is needed.
 
 The token and the repo identity are resolved **once**, at startup.
@@ -154,7 +156,9 @@ One database at `$HERDR_PLUGIN_STATE_DIR/cache.sqlite3`, shared by every pane. `
 
 ```sql
 CREATE TABLE repo (
-  slug TEXT PRIMARY KEY,            -- nameWithOwner as returned by the API
+  slug TEXT PRIMARY KEY,            -- the resolved identity slug (§6), not
+                                    -- nameWithOwner: it is the only key that
+                                    -- exists before the list query returns
   fetched_at INTEGER NOT NULL,      -- unix seconds, last successful list query
   opened_at  INTEGER NOT NULL,      -- last time a pane displayed this repo
   open_count INTEGER
