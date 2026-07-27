@@ -20,7 +20,7 @@ use herdr_issues::cache::Cache;
 use herdr_issues::environment::Environment;
 use herdr_issues::identity::Slug;
 use serde_json::{Value, json};
-use support::{FixtureRepo, StateDir, StubGithub, environment, screen, start};
+use support::{FixtureRepo, StateDir, StubGithub, environment, screen, settle, start};
 
 const REMOTE: &str = "https://github.com/nyanyaon/github-issue-herdr-plugin";
 const SLUG: &str = "nyanyaon/github-issue-herdr-plugin";
@@ -255,7 +255,7 @@ fn a_row_whose_cached_detail_is_behind_the_list_carries_the_marker() {
         "nothing is stale against the list it was read with:\n{warm}"
     );
 
-    app.run_pending_query();
+    settle(&mut app);
 
     let refreshed = screen(&app, 72, 10);
     assert!(
@@ -286,7 +286,7 @@ fn opening_a_stale_issue_fetches_it_once_and_an_unchanged_one_not_at_all() {
 
     let stub = stub_after_seven_moved();
     let mut app = App::start(&pane(&repo.path, &stub, &state));
-    app.run_pending_query();
+    settle(&mut app);
     assert_eq!(stub.request_count(), 1, "the list query, and nothing else");
 
     // The stale issue: readable from the cache first, re-fetched after.
@@ -375,7 +375,7 @@ fn re_fetching_a_stale_issue_drops_its_cached_comment_pages() {
 
     let stub = stub_after_seven_moved();
     let mut app = App::start(&pane(&repo.path, &stub, &state));
-    app.run_pending_query();
+    settle(&mut app);
     press(&mut app, KeyCode::Enter);
     app.run_pending_query();
 
@@ -438,7 +438,7 @@ fn r_refetches_the_open_issue_in_the_detail_view() {
     // A pane where nothing is stale, so nothing would be fetched on its own.
     let stub = stub_as_read();
     let mut app = App::start(&pane(&repo.path, &stub, &state));
-    app.run_pending_query();
+    settle(&mut app);
     press(&mut app, KeyCode::Char('j'));
     press(&mut app, KeyCode::Enter);
     assert_eq!(stub.request_count(), 1, "#8 opened from the cache");
@@ -490,7 +490,7 @@ fn a_failed_refresh_leaves_the_issue_on_screen() {
         graphql_url: "http://127.0.0.1:9/graphql".to_string(),
         ..pane(&repo.path, &stub, &state)
     });
-    app.run_pending_query();
+    settle(&mut app);
     press(&mut app, KeyCode::Enter);
     assert!(screen(&app, 72, 16).contains("The shape as it was."));
 

@@ -31,3 +31,8 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 # The stub GraphQL server gzips its responses, which is how the tests exercise
 # the client's gzip path end to end. Already in the tree via ureq's gzip feature.
 flate2 = "1"
+# The same SQLite the viewer uses, so a test can open the database the pane
+# wrote and assert on the real columns — the access bookkeeping the prune ages
+# rows by, and the rows it left behind. Nothing here mocks below the seam: this
+# is the file, read with SQL.
+rusqlite = { version = "0.37", features = ["bundled"] }

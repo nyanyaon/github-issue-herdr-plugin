@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 
-use crate::cache::Cache;
+use crate::cache::{Cache, PrunePolicy};
 use crate::environment::Environment;
 use crate::github::{ApiError, GithubClient, IssueDetail, IssueList, IssueRow, IssueStates};
 use crate::identity::RepoIdentity;
@@ -67,6 +67,23 @@ pub struct App {
     /// never read has nothing to draw ahead of its request, so it is fetched
     /// there and then instead.
     pending_detail_fetch: Option<u64>,
+    /// The startup prune, queued behind the same seam as the two queries above
+    /// and run after both of them.
+    ///
+    /// SPEC §5 lists the prune at step 4 and the cached first frame at step 6,
+    /// but §12 makes first paint the constraint, and the prune is a *write*: on
+    /// a shared database it can sit behind another pane's writer for as long as
+    /// the busy timeout allows. Ahead of the frame that is a pane blank for up
+    /// to three seconds over rows it already had on disk; behind it, it is
+    /// invisible. Everything step 4 exists for still holds — the prune is on the
+    /// startup path, runs once per launch, and is over before the pane blocks on
+    /// input.
+    ///
+    /// Running it *after* [`App::load_cached_list`] is also what stops a pane
+    /// pruning the repo it is opening: `mark_opened` has already dated this repo
+    /// to now, so a repo unopened for a hundred days is saved by the very act of
+    /// opening it.
+    pending_prune: Option<PrunePolicy>,
     states: IssueStates,
     issue_list: Option<IssueList>,
     detail: Option<IssueDetail>,
@@ -120,6 +137,7 @@ impl App {
             cache: None,
             pending_list_query: false,
             pending_detail_fetch: None,
+            pending_prune: None,
             states: IssueStates::default(),
             issue_list: None,
             detail: None,
@@ -149,10 +167,19 @@ impl App {
         app.identity = Some(identity);
 
         // SPEC §5 step 4: the cache opens before the token is resolved, so that
-        // a pane with no token still has something to show. The startup prune
-        // that belongs beside this is a later ticket.
+        // a pane with no token still has something to show.
         app.cache = Cache::open(environment.state_dir.as_deref());
         app.load_cached_list();
+        // Queued rather than run: see [`App::pending_prune`]. It is queued after
+        // the cached rows have been read, and it outlives the early return
+        // below, because a pane with no token is still a launch and the cache
+        // still wants bounding.
+        app.pending_prune = app.cache.is_some().then(|| {
+            PrunePolicy::after_days(
+                environment.prune_details_after_days,
+                environment.prune_repos_after_days,
+            )
+        });
 
         let Some(token) = environment.token.clone() else {
             // Cached rows stay on screen underneath it: a missing token is a
@@ -172,20 +199,40 @@ impl App {
         app
     }
 
-    /// Whether a query the pane has already drawn for is still to run.
+    /// Whether work the pane has already drawn for is still to do.
     ///
     /// The event loop asks this after every draw, which is what puts the cached
     /// frame on screen before the request goes out — at startup for the list,
-    /// and again whenever a **stale** issue is opened onto its cached body.
+    /// and again whenever a **stale** issue is opened onto its cached body. The
+    /// startup prune rides the same seam for the same reason.
+    ///
+    /// It goes false once, at the end of startup, and only a keystroke can make
+    /// it true again. That is the whole of "no work while idle".
     pub fn has_pending_query(&self) -> bool {
+        self.has_pending_request() || self.pending_prune.is_some()
+    }
+
+    /// The subset of the above that would touch the **network**.
+    ///
+    /// Worth its own name: since the startup prune joined the queue,
+    /// [`App::has_pending_query`] answers "is any work owed", which is what the
+    /// event loop needs but not what "did that failure queue a retry" asks. A
+    /// test reaching for the broader one would see the prune and read it as a
+    /// retry that never existed.
+    pub fn has_pending_request(&self) -> bool {
         self.pending_list_query || self.pending_detail_fetch.is_some()
     }
 
-    /// Runs whichever query the last frame was drawn ahead of — SPEC §5 step 6's
-    /// "then run the list query and re-render", and the same move for one issue.
+    /// Runs whichever piece of work the last frame was drawn ahead of — SPEC §5
+    /// step 6's "then run the list query and re-render", the same move for one
+    /// issue, and the startup prune.
     ///
     /// Cache-first does not mean network-never: without this a warm pane would
     /// show yesterday's rows with no way to move past them.
+    ///
+    /// One piece per call, so the event loop redraws between them. The prune is
+    /// last of the three: everything a user is waiting to see is on screen
+    /// before the cache spends anything on housekeeping.
     pub fn run_pending_query(&mut self) {
         if self.pending_list_query {
             self.pending_list_query = false;
@@ -194,6 +241,10 @@ impl App {
         }
         if let Some(number) = self.pending_detail_fetch.take() {
             self.fetch_detail(number, self.selected);
+            return;
+        }
+        if let (Some(policy), Some(cache)) = (self.pending_prune.take(), self.cache.as_ref()) {
+            cache.prune(policy);
         }
     }
 

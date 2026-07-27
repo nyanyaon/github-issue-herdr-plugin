@@ -51,10 +51,11 @@ pub struct Environment {
     pub list_page_size: u32,
     /// `detail_comment_page_size` — how many comments one detail query asks for.
     pub detail_comment_page_size: u32,
-    /// `prune_details_after_days`. Carried for the startup prune, which is a
-    /// later ticket; nothing in this slice deletes anything.
+    /// `prune_details_after_days` — how long a detail nothing has displayed
+    /// survives the startup prune.
     pub prune_details_after_days: u32,
-    /// `prune_repos_after_days`. Carried, as above.
+    /// `prune_repos_after_days` — how long a repo nothing has opened survives
+    /// it.
     pub prune_repos_after_days: u32,
     /// Whatever `config.toml` got wrong. The app turns a non-empty list into the
     /// one status line it has.

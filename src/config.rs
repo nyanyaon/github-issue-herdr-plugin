@@ -27,12 +27,10 @@ pub struct Config {
     pub list_page_size: u32,
     /// How many comments one detail query asks for. 100 is GraphQL's maximum.
     pub detail_comment_page_size: u32,
-    /// How long an unopened issue detail survives the startup prune.
-    ///
-    /// Parsed and carried, not yet acted on: the prune itself is a later
-    /// ticket, and nothing in this slice deletes anything.
+    /// How long a detail nothing has displayed survives the startup prune.
     pub prune_details_after_days: u32,
-    /// How long an unopened repo survives the startup prune. Carried, as above.
+    /// How long a repo nothing has opened survives it — and it takes the
+    /// repo's list rows and details with it.
     pub prune_repos_after_days: u32,
     /// A file whose first line is a GitHub token — the last source in
     /// ADR-0005's discovery order. The viewer only ever reads it.

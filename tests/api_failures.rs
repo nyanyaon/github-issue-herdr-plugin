@@ -289,10 +289,11 @@ fn a_transport_failure_states_the_age_of_the_cache_it_left_on_screen() {
     assert_cached_rows_survived(&screen, &state);
     assert_eq!(stub.request_count(), 0, "nothing reached a server at all");
 
-    // Nor does a dead network turn into background work: the pane owes nothing
-    // and asks for nothing until a key says so.
+    // Nor does a dead network turn into background work: the pane asks for
+    // nothing until a key says so. The narrower question again — a queued
+    // startup prune is local housekeeping, not a request.
     for _ in 0..3 {
-        assert!(!app.has_pending_query());
+        assert!(!app.has_pending_request());
         app.run_pending_query();
     }
     assert_eq!(stub.request_count(), 0);
@@ -398,11 +399,13 @@ fn no_failure_ever_queues_a_retry() {
         );
 
         // Everything the event loop does between keystrokes, several times over:
-        // it draws, and it asks whether anything is owed. Nothing is.
+        // it draws, and it asks whether anything is owed. No *request* is —
+        // the startup prune may still be queued behind this, which is work but
+        // is not a retry, so this asks the narrower question deliberately.
         for _ in 0..3 {
             assert!(
-                !app.has_pending_query(),
-                "a failure queues no work: {failure:?}"
+                !app.has_pending_request(),
+                "a failure queues no retry: {failure:?}"
             );
             app.run_pending_query();
             screen(&app, 72, 10);

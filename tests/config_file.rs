@@ -173,10 +173,11 @@ fn the_page_sizes_come_from_the_file() {
 }
 
 #[test]
-fn the_prune_ages_are_parsed_and_carried_for_a_prune_that_is_a_later_ticket() {
-    // Nothing prunes yet and nothing renders these, so the environment they land
-    // in is the only place they are visible. Every other key in this file is
-    // asserted through the screen or the wire.
+fn the_prune_ages_are_parsed_and_carried_to_the_pane() {
+    // Nothing renders these, and what they decide is a deletion rather than a
+    // frame, so the environment they land in is where this file can see them.
+    // That they then decide what a launch deletes is
+    // `prune_and_concurrency::a_configured_age_is_the_one_the_prune_uses`.
     let config = ConfigDir::holding("prune_details_after_days = 7\nprune_repos_after_days = 14\n");
     let configured = Environment::default().with_config(config.config());
     assert_eq!(configured.prune_details_after_days, 7);
